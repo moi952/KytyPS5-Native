@@ -1139,11 +1139,21 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2Speake
 int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 	std::memset(info, 0, sizeof(AudioOut2SpeakerInfo));
-	info->type             = 0;
-	info->available_bits   = 0x03;
-	info->flags            = 0;
-	info->speaker_angle[0] = {-30, 0};
-	info->speaker_angle[1] = {30, 0};
+	info->type  = 0;
+	info->flags = 0;
+
+	// The host's real speakers: a 5.1 or larger device reports a 7.1 layout (FL FR C LFE BL BR
+	// SL SR), which SDL folds down to what the device has; anything smaller stays stereo.
+	if (ReportedOutputChannels() >= 8) {
+		info->available_bits = 0xFF;
+		static constexpr AudioOut2SpeakerAngle ANGLES[8] = {{-30, 0}, {30, 0},   {0, 0},    {0, 0},
+		                                                    {-135, 0}, {135, 0}, {-90, 0}, {90, 0}};
+		std::copy(std::begin(ANGLES), std::end(ANGLES), info->speaker_angle);
+	} else {
+		info->available_bits   = 0x03;
+		info->speaker_angle[0] = {-30, 0};
+		info->speaker_angle[1] = {30, 0};
+	}
 
 	return OK;
 }

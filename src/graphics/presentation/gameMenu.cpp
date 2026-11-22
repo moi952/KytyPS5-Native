@@ -3,6 +3,7 @@
 #include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/presentation/exitVideo.h"
 #include "graphics/presentation/performanceOverlay.h"
+#include "libs/audio.h"
 #include "imgui.h"
 
 #include <SDL3/SDL.h>
@@ -10,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -17,7 +19,7 @@ namespace {
 
 enum class Page : uint8_t { Closed, Main, ConfirmExit };
 
-enum MainItem : int { ItemResume, ItemMonitoring, ItemExit, MainItemCount };
+enum MainItem : int { ItemResume, ItemMonitoring, ItemAudio, ItemExit, MainItemCount };
 enum ConfirmItem : int { ConfirmExitGame, ConfirmCancel, ConfirmItemCount };
 
 struct MenuState {
@@ -30,6 +32,22 @@ MenuState             g_state;
 std::atomic<bool>     g_open {false};
 std::atomic<uint64_t> g_revision {0};
 
+// Channels of the host's playback device, read when the menu opens (SteamOS sets the profile, 2/6/8).
+std::atomic<int> g_audio_channels {0};
+
+std::string AudioLabel() {
+	const int ch = g_audio_channels.load(std::memory_order_relaxed);
+	switch (ch) {
+		case 0: return "not detected";
+		case 1: return "Mono (1 ch)";
+		case 2: return "Stereo (2 ch)";
+		case 4: return "Quad (4 ch)";
+		case 6: return "5.1 (6 ch)";
+		case 8: return "7.1 (8 ch)";
+		default: return std::to_string(ch) + " ch";
+	}
+}
+
 // Window thread only: Share and Options held, for the combination.
 bool g_back_down  = false;
 bool g_start_down = false;
@@ -40,6 +58,9 @@ MenuState GetState() {
 }
 
 void SetState(MenuState state) {
+	if (!g_open.load(std::memory_order_acquire) && state.page != Page::Closed) {
+		g_audio_channels.store(Audio::DetectedOutputChannels(true), std::memory_order_relaxed);
+	}
 	{
 		std::scoped_lock lock(g_mutex);
 		g_state = state;
@@ -76,6 +97,11 @@ void Activate(const MenuState& state) {
 		switch (state.selected) {
 			case ItemResume: SetState({}); break;
 			case ItemMonitoring: StepMonitoring(1); break;
+			case ItemAudio:
+				// Read again; the profile is set in SteamOS and a running game keeps what it read at launch.
+				g_audio_channels.store(Audio::DetectedOutputChannels(true), std::memory_order_relaxed);
+				g_revision.fetch_add(1, std::memory_order_acq_rel);
+				break;
 			case ItemExit: SetState({Page::ConfirmExit, ConfirmExitGame}); break;
 			default: break;
 		}
@@ -227,6 +253,8 @@ void DrawGameMenu(vk::Extent2D extent) {
 	if (state.page == Page::Main) {
 		row(ItemResume, "Resume", nullptr);
 		row(ItemMonitoring, "Monitoring", MonitoringLabel(PerformanceOverlayMode()));
+		const std::string audio = AudioLabel();
+		row(ItemAudio, "Audio output", audio.c_str());
 		row(ItemExit, "Exit game", nullptr);
 	} else {
 		ImGui::TextUnformatted("Exit the game?");
