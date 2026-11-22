@@ -27,7 +27,7 @@ if _original_library_path:
 else:
     os.environ.pop("LD_LIBRARY_PATH", None)
 
-REPO = "superkeka/KytyPS5-Native"
+REPO = "moi952/KytyPS5-Native"
 USER = decky.DECKY_USER
 HOME = decky.DECKY_USER_HOME
 SHARE = os.path.join(HOME, ".local/share/KytyPS5-Native")
