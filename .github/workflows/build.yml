@@ -215,11 +215,14 @@ jobs:
 
   release:
     name: Release KytyPS5-Native
+    # The fork also releases from a manual run, so a branch built from the Actions tab can be
+    # installed through the Decky plugin, which reads this repository's latest release.
     if: >-
-      github.event_name == 'push' &&
-      github.repository == 'superkeka/KytyPS5-Native' &&
       needs.linux.result == 'success' &&
-      needs.decky.result == 'success'
+      needs.decky.result == 'success' &&
+      ((github.event_name == 'push' && github.repository == 'superkeka/KytyPS5-Native') ||
+       (github.repository == 'moi952/KytyPS5-Native' &&
+        (github.event_name == 'push' || github.event_name == 'workflow_dispatch')))
     needs: [metadata, linux, decky]
     runs-on: ubuntu-latest
     permissions:
