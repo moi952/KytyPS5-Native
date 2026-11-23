@@ -11,7 +11,8 @@ namespace Libs::Graphics {
 
 // The in-game menu (KytyPS5-Native): the PS button, Share and Options together, or F10 opens it over
 // the game, as the PS5's own menu. Resume, monitoring (the performance overlay) and leaving the game,
-// all from a gamepad, with nothing of Steam running.
+// all from a gamepad, with nothing of Steam running. Its Settings page holds what changes while the game
+// runs, and its Info page what the game was started with.
 
 // Window thread. True when the event was the menu's (the game does not get it). Button releases
 // always go on to the game, so nothing stays held there while the menu is open.
@@ -19,6 +20,9 @@ bool ProcessGameMenuInput(const SDL_Event& event);
 
 [[nodiscard]] bool     GameMenuOpen() noexcept;
 [[nodiscard]] uint64_t GameMenuRevision() noexcept;
+
+// The Settings page's early present: a ready flip is shown at once, not at the next tick (present thread).
+[[nodiscard]] bool EarlyPresentEnabled() noexcept;
 
 // Present thread, between ImGui::NewFrame() and ImGui::Render().
 void DrawGameMenu(vk::Extent2D extent);

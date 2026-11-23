@@ -1,5 +1,6 @@
 #include "graphics/presentation/gameMenu.h"
 
+#include "common/emulatorConfig.h"
 #include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/presentation/exitVideo.h"
 #include "graphics/presentation/performanceOverlay.h"
@@ -10,16 +11,22 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
 namespace {
 
-enum class Page : uint8_t { Closed, Main, ConfirmExit };
+enum class Page : uint8_t { Closed, Main, Settings, Info, ConfirmExit };
 
-enum MainItem : int { ItemResume, ItemMonitoring, ItemAudio, ItemExit, MainItemCount };
+enum MainItem : int { ItemResume, ItemMonitoring, ItemSettings, ItemInfo, ItemExit, MainItemCount };
+enum SettingsItem : int { SettingEarly, SettingBack, SettingsItemCount };
 enum ConfirmItem : int { ConfirmExitGame, ConfirmCancel, ConfirmItemCount };
 
 struct MenuState {
@@ -48,6 +55,71 @@ std::string AudioLabel() {
 	}
 }
 
+std::atomic<bool> g_early_present {false};
+
+const char* PresentModeLabel(Config::PresentMode mode) {
+	switch (mode) {
+		case Config::PresentMode::Fifo: return "FIFO";
+		case Config::PresentMode::Mailbox: return "Mailbox";
+		case Config::PresentMode::Immediate: return "Immediate";
+	}
+	return "?";
+}
+
+std::string FirstLine(const std::string& path) {
+	std::ifstream file(path);
+	std::string   line;
+	std::getline(file, line);
+	return line;
+}
+
+// What the Info page shows, read when it opens.
+std::mutex                                       g_info_mutex;
+std::vector<std::pair<std::string, std::string>> g_info;
+
+void RefreshInfo() {
+	std::vector<std::pair<std::string, std::string>> rows;
+	g_audio_channels.store(Audio::DetectedOutputChannels(true), std::memory_order_relaxed);
+	rows.emplace_back("Audio output", AudioLabel());
+	rows.emplace_back("Refresh rate", std::to_string(Config::GetVblankFrequency()) + " Hz");
+	rows.emplace_back("Present mode", PresentModeLabel(Config::GetPresentMode()));
+	const char* copy = std::getenv("KYTY_NATIVE_GPU_DISPLAY_COPY");
+	rows.emplace_back("Display copy", copy != nullptr ? copy : "2 (default)");
+	rows.emplace_back("Early present", g_early_present.load(std::memory_order_relaxed) ? "On" : "Off");
+	rows.emplace_back("Rendering", NativeGpu::PrimaryRendering() ? "native PS5 GPU path" : "Vulkan path");
+
+	std::ifstream meminfo("/proc/meminfo");
+	std::string   line;
+	while (std::getline(meminfo, line)) {
+		unsigned long kib = 0;
+		if (std::sscanf(line.c_str(), "MemAvailable: %lu kB", &kib) == 1) {
+			char text[32];
+			std::snprintf(text, sizeof(text), "%.1f GB", static_cast<double>(kib) / (1024.0 * 1024.0));
+			rows.emplace_back("Memory available", text);
+			break;
+		}
+	}
+	const std::string drm = "/sys/class/drm/card0/device/";
+	std::ifstream     clocks(drm + "pp_dpm_sclk");
+	while (std::getline(clocks, line)) {
+		int mhz = 0;
+		if (line.find('*') != std::string::npos && std::sscanf(line.c_str(), "%*d: %dMhz", &mhz) == 1) {
+			std::string value = std::to_string(mhz) + " MHz";
+			for (int i = 0; i < 10; i++) {
+				const std::string temp = FirstLine(drm + "hwmon/hwmon" + std::to_string(i) + "/temp1_input");
+				if (!temp.empty()) {
+					value += ", " + std::to_string(std::atoi(temp.c_str()) / 1000) + " C";
+					break;
+				}
+			}
+			rows.emplace_back("GPU", value);
+			break;
+		}
+	}
+	std::scoped_lock lock(g_info_mutex);
+	g_info = std::move(rows);
+}
+
 // Window thread only: Share and Options held, for the combination.
 bool g_back_down  = false;
 bool g_start_down = false;
@@ -70,7 +142,17 @@ void SetState(MenuState state) {
 }
 
 int ItemCount(Page page) {
-	return page == Page::ConfirmExit ? ConfirmItemCount : MainItemCount;
+	switch (page) {
+		case Page::Settings: return SettingsItemCount;
+		case Page::Info: return 1;
+		case Page::ConfirmExit: return ConfirmItemCount;
+		default: return MainItemCount;
+	}
+}
+
+void ToggleEarly() {
+	g_early_present.store(!g_early_present.load(std::memory_order_relaxed), std::memory_order_relaxed);
+	g_revision.fetch_add(1, std::memory_order_acq_rel);
 }
 
 const char* MonitoringLabel(int mode) {
@@ -97,14 +179,26 @@ void Activate(const MenuState& state) {
 		switch (state.selected) {
 			case ItemResume: SetState({}); break;
 			case ItemMonitoring: StepMonitoring(1); break;
-			case ItemAudio:
-				// Read again; the profile is set in SteamOS and a running game keeps what it read at launch.
-				g_audio_channels.store(Audio::DetectedOutputChannels(true), std::memory_order_relaxed);
-				g_revision.fetch_add(1, std::memory_order_acq_rel);
+			case ItemSettings: SetState({Page::Settings, SettingEarly}); break;
+			case ItemInfo:
+				RefreshInfo();
+				SetState({Page::Info, 0});
 				break;
 			case ItemExit: SetState({Page::ConfirmExit, ConfirmExitGame}); break;
 			default: break;
 		}
+		return;
+	}
+	if (state.page == Page::Settings) {
+		if (state.selected == SettingEarly) {
+			ToggleEarly();
+		} else {
+			SetState({Page::Main, ItemSettings});
+		}
+		return;
+	}
+	if (state.page == Page::Info) {
+		SetState({Page::Main, ItemInfo});
 		return;
 	}
 	if (state.selected == ConfirmExitGame) {
@@ -117,7 +211,12 @@ void Activate(const MenuState& state) {
 }
 
 void Back(const MenuState& state) {
-	SetState(state.page == Page::ConfirmExit ? MenuState {Page::Main, ItemExit} : MenuState {});
+	switch (state.page) {
+		case Page::Settings: SetState({Page::Main, ItemSettings}); break;
+		case Page::Info: SetState({Page::Main, ItemInfo}); break;
+		case Page::ConfirmExit: SetState({Page::Main, ItemExit}); break;
+		default: SetState({}); break;
+	}
 }
 
 // Navigation shared by the gamepad and the keyboard. True when the menu took the input.
@@ -132,6 +231,8 @@ bool Navigate(int up_down, int left_right, bool accept, bool back) {
 		SetState(state);
 	} else if (left_right != 0 && state.page == Page::Main && state.selected == ItemMonitoring) {
 		StepMonitoring(left_right);
+	} else if (left_right != 0 && state.page == Page::Settings && state.selected == SettingEarly) {
+		ToggleEarly();
 	} else if (accept) {
 		Activate(state);
 	} else if (back) {
@@ -195,6 +296,10 @@ bool ProcessGameMenuInput(const SDL_Event& event) {
 	return false;
 }
 
+bool EarlyPresentEnabled() noexcept {
+	return g_early_present.load(std::memory_order_relaxed);
+}
+
 bool GameMenuOpen() noexcept {
 	return g_open.load(std::memory_order_acquire);
 }
@@ -253,9 +358,25 @@ void DrawGameMenu(vk::Extent2D extent) {
 	if (state.page == Page::Main) {
 		row(ItemResume, "Resume", nullptr);
 		row(ItemMonitoring, "Monitoring", MonitoringLabel(PerformanceOverlayMode()));
-		const std::string audio = AudioLabel();
-		row(ItemAudio, "Audio output", audio.c_str());
+		row(ItemSettings, "Settings", nullptr);
+		row(ItemInfo, "Info", nullptr);
 		row(ItemExit, "Exit game", nullptr);
+	} else if (state.page == Page::Settings) {
+		ImGui::TextUnformatted("Settings");
+		row(SettingEarly, "Early present", g_early_present.load(std::memory_order_relaxed) ? "On" : "Off");
+		ImGui::TextDisabled("Shows a ready frame at once, not at the next tick.");
+		row(SettingBack, "Back", nullptr);
+	} else if (state.page == Page::Info) {
+		ImGui::TextUnformatted("Info");
+		std::vector<std::pair<std::string, std::string>> rows;
+		{
+			std::scoped_lock lock(g_info_mutex);
+			rows = g_info;
+		}
+		for (const auto& [label, value]: rows) {
+			row(-1, label.c_str(), value.c_str());
+		}
+		row(0, "Back", nullptr);
 	} else {
 		ImGui::TextUnformatted("Exit the game?");
 		ImGui::TextDisabled("Progress the game has not saved is lost.");

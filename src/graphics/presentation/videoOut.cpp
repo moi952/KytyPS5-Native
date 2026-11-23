@@ -1,4 +1,5 @@
 #include "common/knobFile.h"
+#include "graphics/presentation/gameMenu.h"
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
@@ -1101,7 +1102,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Clock::now();
 		if (total_wait.count() > 0) {
-			if (KnobFile("early") == 0) {
+			if (!Graphics::EarlyPresentEnabled() && KnobFile("early") == 0) {
 				Common::Thread::SleepNano(static_cast<uint64_t>(total_wait.count()));
 			} else {
 				// To try (~/.config/KytyPS5-Native/vrr, early=1): a ready flip is shown at once, not at the next tick.
