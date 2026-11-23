@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <mutex>
@@ -72,14 +73,10 @@ static bool audio_out_port_type_is_valid(int type) {
 } // namespace
 
 static std::atomic_int g_device_channels {0};
-// Output streams a port has open. While one is, SDL reports the format that stream opened the device with,
-// so the hardware's channels cannot be read again and the value read before is kept.
 static std::atomic_int g_open_streams {0};
 
-// The physical device opens with the spec of the first logical device on it: a stereo first stream
-// (the game's system sounds) would leave every later 8 ch stream mixed down to 2. A logical device of
-// the host's channels, opened before any stream and kept, holds the device at them. It holds one SDL
-// audio init of its own.
+// SDL opens the physical device with the format of the first stream on it (stereo, for the game's
+// first port): this device, opened first at the host's channels, keeps later streams from being mixed to 2.
 static std::mutex         g_holder_mutex;
 static SDL_AudioDeviceID  g_holder = 0;
 
@@ -110,18 +107,34 @@ static void EnsureHolder(int freq) {
 	}
 }
 
+static int ForcedOutputChannels() {
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_AUDIO_CHANNELS");
+		const int   n     = value != nullptr ? std::atoi(value) : 0;
+		if (n == 2 || n == 6 || n == 8) {
+			std::fprintf(stderr, "audio: output channels forced to %d (KYTY_AUDIO_CHANNELS)\n", n);
+			return n;
+		}
+		return 0;
+	}();
+	return forced;
+}
+
 int DetectedOutputChannels(bool refresh) {
+	if (const int forced = ForcedOutputChannels(); forced > 0) {
+		g_device_channels.store(forced, std::memory_order_relaxed);
+		EnsureHolder(48000);
+		return forced;
+	}
+
 	const int cached = g_device_channels.load(std::memory_order_relaxed);
 	if (cached > 0 && (!refresh || g_open_streams.load(std::memory_order_relaxed) > 0)) {
 		return cached;
 	}
-	// With no stream open, the hardware can be read again (the output may have changed) once the
-	// holder, which would report its own format, is released; the next port holds the device again.
 	if (refresh) {
 		ReleaseHolder();
 	}
 
-	// SDL counts init calls, so this leaves a running output port's audio subsystem alone.
 	if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
 		return g_device_channels.load(std::memory_order_relaxed);
 	}
@@ -304,8 +317,6 @@ void Initialize() {
 	EXIT_IF(g_audio != nullptr);
 
 	g_audio = new Audio;
-	// Before anything else (the pad's haptics, sounds of the system) opens the output with its own
-	// format: read the hardware's channels and hold the device at them.
 	(void)DetectedOutputChannels();
 }
 
@@ -359,7 +370,6 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 		return false;
 	}
 
-	// Read the hardware's channels before this stream opens the device with its own.
 	(void)DetectedOutputChannels();
 
 	EnsureHolder(static_cast<int>(port->freq));
@@ -390,12 +400,9 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	    device_frames > 0 && device_spec.freq > 0) {
 		port->device_period_s = static_cast<double>(device_frames) / device_spec.freq;
 	}
-	// device_spec is not kept as the host's channel count: once a stream opens the device, SDL reports the
-	// format it was opened with (the first port's, often stereo), not the hardware's.
 
 	LOGF("AudioOut: opened SDL stream (%d Hz, %d ch, format 0x%04x)\n", desired.freq,
 	     desired.channels, static_cast<unsigned>(desired.format));
-	// In the game's log, which LOGF does not reach: what the port asked for, and what the hardware has.
 	std::fprintf(stderr, "audio: SDL stream opened, %d Hz, %d ch asked, host device %d ch (read before the open), device now %d ch\n",
 	             desired.freq, desired.channels, g_device_channels.load(std::memory_order_relaxed), device_spec.channels);
 	return true;

@@ -1143,8 +1143,7 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t f
 	info->type  = 0;
 	info->flags = 0;
 
-	// The host's real speakers, in the order FL FR C LFE BL BR SL SR: 8 only for a device that has
-	// them (7.1), 6 for a 5.1 one, else stereo. (The ports still take 8 channels: 5.1 is sent in them.)
+	// Speakers in the order FL FR C LFE BL BR SL SR; the ports still take 8 channels, 5.1 is sent in them.
 	const int host     = DetectedOutputChannels();
 	const int speakers = host >= 8 ? 8 : (host >= 6 ? 6 : 2);
 	static std::atomic_int speaker_logs {0};

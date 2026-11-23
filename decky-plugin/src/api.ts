@@ -32,6 +32,8 @@ export interface State {
   gone: Record<string, { appid: number }>;
   videos: Record<string, boolean>;
   hdr: boolean;
+  // The audio output's channels for every game: "auto" (what the device reports), "2", "6" or "8".
+  audio: string;
   kernel: { items: KernelItem[]; method: "files" | "rpm-ostree" | "limine" | "unsupported"; ours: boolean; reboot: boolean; all_ok: boolean };
   game_running: boolean;
 }
@@ -74,6 +76,8 @@ export interface GameInfo {
   present_mode: string;
   // How Kyty copies the game's video-out buffers before showing them: "2" (default), "0" none, "1" all.
   display_copy: string;
+  // The game's own audio channels: "global" (the setting for every game), "auto", "2", "6" or "8".
+  audio: string;
   game_running: boolean;
 }
 
@@ -118,6 +122,8 @@ export const setAddon = callable<[titleId: string, label: string, on: boolean], 
 export const findAddons = callable<[titleId: string], Result>("find_addons");
 export const setPresentMode = callable<[titleId: string, mode: string], Result>("set_present_mode");
 export const setDisplayCopy = callable<[titleId: string, mode: string], Result>("set_display_copy");
+export const setAudio = callable<[titleId: string, mode: string], Result>("set_audio");
+export const setAudioDefault = callable<[mode: string], Result>("set_audio_default");
 export const getPatches = callable<[titleId: string, again: boolean], Patches>("get_patches");
 // With no name and `on` false: all of them off.
 export const setPatch = callable<[titleId: string, name: string, on: boolean], Result>("set_patch");
