@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
+#include "common/knobFile.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "emulator.h"
@@ -196,6 +197,10 @@ static int KYTY_SYSV_ABI SystemServiceGetStatus(SystemServiceStatus* status) {
 	{
 		std::scoped_lock lock(g_event_mutex);
 		status->event_num = static_cast<int32_t>(g_events.size());
+	}
+	// To try on a game without a new build: bytes 6 to 13 of the status, from ~/.config/KytyPS5-Native/vrr.
+	if (const uint64_t extra = KnobFile("sysstatus"); extra != 0) {
+		std::memcpy(reinterpret_cast<uint8_t*>(status) + 6, &extra, sizeof(extra));
 	}
 
 	return OK;
