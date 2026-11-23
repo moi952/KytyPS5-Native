@@ -11,9 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cstdio>
 #include <cstdlib>
-#include <fstream>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -66,13 +64,6 @@ const char* PresentModeLabel(Config::PresentMode mode) {
 	return "?";
 }
 
-std::string FirstLine(const std::string& path) {
-	std::ifstream file(path);
-	std::string   line;
-	std::getline(file, line);
-	return line;
-}
-
 // What the Info page shows, read when it opens.
 std::mutex                                       g_info_mutex;
 std::vector<std::pair<std::string, std::string>> g_info;
@@ -85,37 +76,7 @@ void RefreshInfo() {
 	rows.emplace_back("Present mode", PresentModeLabel(Config::GetPresentMode()));
 	const char* copy = std::getenv("KYTY_NATIVE_GPU_DISPLAY_COPY");
 	rows.emplace_back("Display copy", copy != nullptr ? copy : "2 (default)");
-	rows.emplace_back("Early present", g_early_present.load(std::memory_order_relaxed) ? "On" : "Off");
 	rows.emplace_back("Rendering", NativeGpu::PrimaryRendering() ? "native PS5 GPU path" : "Vulkan path");
-
-	std::ifstream meminfo("/proc/meminfo");
-	std::string   line;
-	while (std::getline(meminfo, line)) {
-		unsigned long kib = 0;
-		if (std::sscanf(line.c_str(), "MemAvailable: %lu kB", &kib) == 1) {
-			char text[32];
-			std::snprintf(text, sizeof(text), "%.1f GB", static_cast<double>(kib) / (1024.0 * 1024.0));
-			rows.emplace_back("Memory available", text);
-			break;
-		}
-	}
-	const std::string drm = "/sys/class/drm/card0/device/";
-	std::ifstream     clocks(drm + "pp_dpm_sclk");
-	while (std::getline(clocks, line)) {
-		int mhz = 0;
-		if (line.find('*') != std::string::npos && std::sscanf(line.c_str(), "%*d: %dMhz", &mhz) == 1) {
-			std::string value = std::to_string(mhz) + " MHz";
-			for (int i = 0; i < 10; i++) {
-				const std::string temp = FirstLine(drm + "hwmon/hwmon" + std::to_string(i) + "/temp1_input");
-				if (!temp.empty()) {
-					value += ", " + std::to_string(std::atoi(temp.c_str()) / 1000) + " C";
-					break;
-				}
-			}
-			rows.emplace_back("GPU", value);
-			break;
-		}
-	}
 	std::scoped_lock lock(g_info_mutex);
 	g_info = std::move(rows);
 }
@@ -158,13 +119,15 @@ void ToggleEarly() {
 const char* MonitoringLabel(int mode) {
 	switch (mode) {
 		case 1: return "FPS";
-		case 2: return "Detailed";
+		case 2: return "Compact";
+		case 3: return "Detailed";
+		case 4: return "Machine";
 		default: return "Off";
 	}
 }
 
 void StepMonitoring(int step) {
-	SetPerformanceOverlayMode((PerformanceOverlayMode() + step + 3) % 3);
+	SetPerformanceOverlayMode((PerformanceOverlayMode() + step + 5) % 5);
 	g_revision.fetch_add(1, std::memory_order_acq_rel);
 }
 

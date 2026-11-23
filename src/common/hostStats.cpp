@@ -4,6 +4,7 @@
 #include "common/timer.h"
 
 #include <algorithm>
+#include <array>
 #include <thread>
 #include <unordered_map>
 
@@ -384,7 +385,9 @@ std::optional<uint64_t> Find(const ProcValues& values, const char* key) {
 	return it != values.end() ? std::optional(it->second) : std::nullopt;
 }
 
-struct PlatformState {};
+struct PlatformState {
+	std::vector<std::array<uint64_t, 2>> cores; // Each core's total and busy ticks at the last sample.
+};
 
 void SampleThreads(HostStats& stats, Counters& now) {
 	static const double ns_per_tick = 1e9 / static_cast<double>(std::max(sysconf(_SC_CLK_TCK), 1L));
@@ -424,7 +427,7 @@ void SampleThreads(HostStats& stats, Counters& now) {
 	}
 }
 
-void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
+void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 	SampleRusage(now);
 
 	std::ifstream cpu_file("/proc/stat");
@@ -441,6 +444,73 @@ void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 		}
 		now.system_total = total;
 		now.system_busy  = total - idle;
+	}
+
+	// Each logical core's share since the previous sample, from the "cpuN" lines.
+	{
+		std::ifstream cores("/proc/stat");
+		std::string   core_line;
+		size_t        index = 0;
+		while (std::getline(cores, core_line)) {
+			if (core_line.size() < 4 || core_line.rfind("cpu", 0) != 0 || core_line[3] < '0' || core_line[3] > '9') {
+				continue;
+			}
+			std::istringstream fields(core_line);
+			std::string        name;
+			fields >> name;
+			uint64_t total = 0;
+			uint64_t idle  = 0;
+			uint64_t value = 0;
+			for (int i = 0; i < 8 && fields >> value; i++) {
+				total += value;
+				if (i == 3 || i == 4) {
+					idle += value;
+				}
+			}
+			const uint64_t busy = total - idle;
+			if (index < state.cores.size() && total > state.cores[index][0] && busy >= state.cores[index][1]) {
+				stats.core_percent.push_back(std::clamp(static_cast<double>(busy - state.cores[index][1]) /
+				                                            static_cast<double>(total - state.cores[index][0]) * 100.0,
+				                                        0.0, 100.0));
+			}
+			if (index >= state.cores.size()) {
+				state.cores.resize(index + 1);
+			}
+			state.cores[index] = {total, busy};
+			index++;
+		}
+	}
+
+	// Temperatures, clock and power from the hwmon nodes of the CPU (k10temp) and the GPU (amdgpu).
+	{
+		std::error_code error;
+		for (std::filesystem::directory_iterator it("/sys/class/hwmon", error), end; !error && it != end;
+		     it.increment(error)) {
+			std::string   name;
+			std::ifstream name_file(it->path() / "name");
+			name_file >> name;
+			const auto number = [&](const char* file, double divisor) -> std::optional<double> {
+				std::ifstream node(it->path() / file);
+				double        value = 0.0;
+				if (node >> value) {
+					return value / divisor;
+				}
+				return std::nullopt;
+			};
+			if (name == "k10temp") {
+				stats.cpu_temp_c = number("temp1_input", 1000.0);
+			} else if (name == "amdgpu") {
+				stats.gpu_temp_c   = number("temp1_input", 1000.0);
+				stats.gpu_power_w  = number("power1_average", 1e6);
+				stats.gpu_clock_mhz = number("freq1_input", 1e6);
+			}
+		}
+		// The kernel does not report this on every GPU (the BC-250 does not).
+		std::ifstream busy("/sys/class/drm/card0/device/gpu_busy_percent");
+		double        percent = 0.0;
+		if (busy >> percent) {
+			stats.gpu_percent = percent;
+		}
 	}
 
 	const auto status         = ReadProcValues("/proc/self/status");
@@ -479,6 +549,7 @@ void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 	double        stalled = 0.0;
 	if (pressure >> kind >> average && kind == "some" && average.rfind("avg10=", 0) == 0 &&
 	    std::istringstream(average.substr(6)) >> stalled) {
+		stats.memory_stall_percent = stalled;
 		stats.memory_pressure = stalled >= 20.0  ? MemoryPressure::Critical
 		                        : stalled >= 5.0 ? MemoryPressure::Warning
 		                                         : MemoryPressure::Normal;
