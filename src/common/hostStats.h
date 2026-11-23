@@ -82,6 +82,9 @@ public:
 
 	[[nodiscard]] HostStats Sample();
 
+	// The GPU's busy share (Linux, AMD) is sampled by a thread of its own only while it is wanted.
+	void SetGpuLoadWanted(bool wanted);
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

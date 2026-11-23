@@ -198,6 +198,7 @@ void SamplerThread(const std::stop_token& stop) {
 			sampler.emplace();
 			sampled_generation = generation;
 		}
+		sampler->SetGpuLoadWanted(g_view.load(std::memory_order_acquire) == 3);
 		auto stats = sampler->Sample();
 		lock.lock();
 		g_host_stats      = std::move(stats);

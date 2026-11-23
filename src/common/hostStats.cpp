@@ -24,9 +24,13 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 #else
+#include <atomic>
+#include <chrono>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
@@ -60,6 +64,8 @@ uint64_t FileTimeTo100Ns(const FILETIME& time) {
 }
 
 struct PlatformState {};
+
+void WantGpuLoad(PlatformState& /*state*/, bool /*wanted*/) {}
 
 void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 	const auto process = GetCurrentProcess();
@@ -276,6 +282,8 @@ void SampleThreads(HostStats& stats, Counters& now) {
 	vm_deallocate(task, reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_act_t));
 }
 
+void WantGpuLoad(PlatformState& /*state*/, bool /*wanted*/) {}
+
 void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 	SampleRusage(now);
 
@@ -385,9 +393,97 @@ std::optional<uint64_t> Find(const ProcValues& values, const char* key) {
 	return it != values.end() ? std::optional(it->second) : std::nullopt;
 }
 
+// The GPU's busy share from GRBM_STATUS (GUI_ACTIVE), as radeontop reads it: the kernel reports no load on every
+// GPU (the BC-250's does not). A thread of its own samples it, and only while it is wanted.
+struct GpuBusy {
+	struct Query { // drm_amdgpu_info with its read_mmr_reg member
+		uint64_t return_pointer;
+		uint32_t return_size;
+		uint32_t query;
+		uint32_t dword_offset;
+		uint32_t count;
+		uint32_t instance;
+		uint32_t flags;
+	};
+
+	std::atomic<uint64_t> busy {0};
+	std::atomic<uint64_t> total {0};
+	std::atomic<bool>     wanted {false};
+	std::jthread          thread;
+	bool                  tried = false;
+
+	static bool ReadStatus(int fd, uint32_t* value) {
+		Query query {reinterpret_cast<uintptr_t>(value), 4, 0x15 /* AMDGPU_INFO_READ_MMR_REG */, 0x2004 /* GRBM_STATUS */, 1,
+		             0xffffffffu, 0};
+		return ioctl(fd, _IOW('d', 0x45, Query), &query) == 0;
+	}
+
+	static int Open() {
+		for (int i = 128; i < 192; i++) {
+			std::string   vendor;
+			std::ifstream vendor_file("/sys/class/drm/renderD" + std::to_string(i) + "/device/vendor");
+			vendor_file >> vendor;
+			if (vendor != "0x1002") {
+				continue;
+			}
+			const int fd = ::open(("/dev/dri/renderD" + std::to_string(i)).c_str(), O_RDWR | O_CLOEXEC);
+			if (fd < 0) {
+				continue;
+			}
+			uint32_t value = 0;
+			if (ReadStatus(fd, &value)) {
+				return fd;
+			}
+			::close(fd);
+		}
+		return -1;
+	}
+
+	void Want(bool on) {
+		wanted.store(on, std::memory_order_relaxed);
+		if (!on || tried) {
+			return;
+		}
+		tried        = true;
+		const int fd = Open();
+		if (fd < 0) {
+			return;
+		}
+		thread = std::jthread([this, fd](const std::stop_token& stop) {
+			while (!stop.stop_requested()) {
+				if (wanted.load(std::memory_order_relaxed)) {
+					uint32_t value = 0;
+					if (ReadStatus(fd, &value)) {
+						total.fetch_add(1, std::memory_order_relaxed);
+						if (((value >> 31u) & 1u) != 0) {
+							busy.fetch_add(1, std::memory_order_relaxed);
+						}
+					}
+					std::this_thread::sleep_for(std::chrono::milliseconds(5));
+				} else {
+					std::this_thread::sleep_for(std::chrono::milliseconds(200));
+				}
+			}
+			::close(fd);
+		});
+	}
+
+	// The share since the last call, 200 samples a second; nothing until there are enough.
+	std::optional<double> Take() {
+		const uint64_t samples = total.exchange(0, std::memory_order_relaxed);
+		const uint64_t active  = busy.exchange(0, std::memory_order_relaxed);
+		return samples >= 20 ? std::optional(100.0 * static_cast<double>(active) / static_cast<double>(samples)) : std::nullopt;
+	}
+};
+
 struct PlatformState {
 	std::vector<std::array<uint64_t, 2>> cores; // Each core's total and busy ticks at the last sample.
+	GpuBusy                              gpu;
 };
+
+void WantGpuLoad(PlatformState& state, bool wanted) {
+	state.gpu.Want(wanted);
+}
 
 void SampleThreads(HostStats& stats, Counters& now) {
 	static const double ns_per_tick = 1e9 / static_cast<double>(std::max(sysconf(_SC_CLK_TCK), 1L));
@@ -505,12 +601,7 @@ void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 				stats.gpu_clock_mhz = number("freq1_input", 1e6);
 			}
 		}
-		// The kernel does not report this on every GPU (the BC-250 does not).
-		std::ifstream busy("/sys/class/drm/card0/device/gpu_busy_percent");
-		double        percent = 0.0;
-		if (busy >> percent) {
-			stats.gpu_percent = percent;
-		}
+		stats.gpu_percent = state.gpu.Take();
 	}
 
 	const auto status         = ReadProcValues("/proc/self/status");
@@ -580,6 +671,10 @@ struct HostStatsSampler::Impl {
 HostStatsSampler::HostStatsSampler(): m_impl(std::make_unique<Impl>()) {}
 
 HostStatsSampler::~HostStatsSampler() = default;
+
+void HostStatsSampler::SetGpuLoadWanted(bool wanted) {
+	WantGpuLoad(m_impl->state, wanted);
+}
 
 HostStats HostStatsSampler::Sample() {
 	HostStats stats;
