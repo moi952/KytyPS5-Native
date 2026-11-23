@@ -33,6 +33,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <string>
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
@@ -2350,6 +2353,10 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	PRINT_NAME();
 
 	LOGF("\trate = %d\n", rate);
+	static std::atomic_int rate_traced {0};
+	if (rate_traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::fprintf(stderr, "vrr: set flip rate handle %d rate %d, from %p\n", handle, rate, __builtin_return_address(0));
+	}
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -2404,6 +2411,10 @@ KYTY_SYSV_ABI int VideoOutAddPreVblankStartEvent(LibKernel::EventQueue::KernelEq
 KYTY_SYSV_ABI int VideoOutAddOutputModeEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                              void* udata) {
 	PRINT_NAME();
+	static std::atomic_int mode_event_traced {0};
+	if (mode_event_traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::fprintf(stderr, "vrr: add output mode event handle %d, from %p\n", handle, __builtin_return_address(0));
+	}
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::OutputMode, udata);
 }
 
@@ -3165,6 +3176,40 @@ KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 	return OK;
 }
 
+// Values to try on a game without a new build, read from ~/.config/KytyPS5-Native/vrr (a "key=value"
+// line each, decimal or 0x hex) at most once a second: flags (the output status's flags), ext (the 8
+// bytes after the output status in the VRR status). 0 when there is none.
+uint64_t VrrKnob(const char* key) {
+	static std::mutex                                    mutex;
+	static std::chrono::steady_clock::time_point         read_at {};
+	static std::array<std::pair<std::string, uint64_t>, 8> values {};
+	static size_t                                        count = 0;
+
+	std::scoped_lock lock(mutex);
+	const auto       now = std::chrono::steady_clock::now();
+	if (read_at == std::chrono::steady_clock::time_point {} || now - read_at > std::chrono::seconds(1)) {
+		read_at = now;
+		count   = 0;
+		const char* base = std::getenv("XDG_CONFIG_HOME");
+		const char* home = std::getenv("HOME");
+		std::string path = base != nullptr ? std::string(base) : (home != nullptr ? std::string(home) + "/.config" : "");
+		std::ifstream file(path + "/KytyPS5-Native/vrr");
+		std::string   line;
+		while (std::getline(file, line) && count < values.size()) {
+			const auto eq = line.find('=');
+			if (eq != std::string::npos) {
+				values[count++] = {line.substr(0, eq), std::strtoull(line.c_str() + eq + 1, nullptr, 0)};
+			}
+		}
+	}
+	for (size_t i = 0; i < count; i++) {
+		if (values[i].first == key) {
+			return values[i].second;
+		}
+	}
+	return 0;
+}
+
 KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status) {
 	PRINT_NAME();
 
@@ -3198,11 +3243,22 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
 	         ? VIDEO_OUT_REFRESH_RATE_119_88HZ
 	         : VIDEO_OUT_REFRESH_RATE_59_94HZ);
-	status->flags       = 0;
+	status->flags       = VrrKnob("flags");
 	status->reserved[0] = 0;
 	status->reserved[1] = 0;
 	status->reserved[2] = 0;
 	ctx->mutex.Unlock();
+
+	static std::atomic_int reads {0};
+	const int              nth = reads.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (nth <= 8 || nth % 300 == 0) {
+		std::fprintf(stderr,
+		             "vrr: output status read #%d handle %d, from %p: resolution %u dynamicRange %u refreshRate %" PRIu64
+		             " flags 0x%" PRIx64 "\n",
+		             nth, handle, __builtin_return_address(0), static_cast<unsigned>(status->resolution),
+		             static_cast<unsigned>(status->dynamicRange), static_cast<uint64_t>(status->refreshRate),
+		             static_cast<uint64_t>(status->flags));
+	}
 
 	return OK;
 }
@@ -3224,6 +3280,11 @@ KYTY_SYSV_ABI int VideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t 
 		     "\t arg2   = 0x%016" PRIx64 "\n",
 		     handle, arg1, arg2);
 	}
+	static std::atomic_int traced {0};
+	if (traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::fprintf(stderr, "vrr: peg to fixed rate handle %d arg1 0x%" PRIx64 " arg2 0x%" PRIx64 ", from %p\n",
+		             handle, arg1, arg2, __builtin_return_address(0));
+	}
 
 	return OK;
 }
@@ -3234,6 +3295,10 @@ KYTY_SYSV_ABI int VideoOutVrrUnpegFromFixedRate(int handle) {
 	static std::atomic_bool logged {false};
 	if (!logged.exchange(true, std::memory_order_relaxed)) {
 		LOGF("\t handle = %d\n", handle);
+	}
+	static std::atomic_int traced {0};
+	if (traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::fprintf(stderr, "vrr: unpeg from fixed rate handle %d, from %p\n", handle, __builtin_return_address(0));
 	}
 
 	return OK;
@@ -3283,6 +3348,17 @@ KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
 	PRINT_NAME();
 
 	LOGF("\t mode = 0x%016" PRIx64 "\n", mode);
+	static std::atomic_int supported_traced {0};
+	if (supported_traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		char hex[sizeof(VideoOutOutputOptions) * 3 + 1] = {};
+		if (options != nullptr) {
+			for (size_t i = 0; i < sizeof(VideoOutOutputOptions); i++) {
+				std::snprintf(hex + i * 3, 4, "%02x ", reinterpret_cast<const uint8_t*>(options)[i]);
+			}
+		}
+		std::fprintf(stderr, "vrr: is output supported handle %d mode 0x%" PRIx64 " options %s, from %p\n", handle, mode,
+		             hex, __builtin_return_address(0));
+	}
 
 	int result = ValidateOutputConfig(handle, mode, options, reserved_ptr, reserved);
 	if (result != OK) {
