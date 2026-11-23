@@ -1,3 +1,4 @@
+#include "common/knobFile.h"
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
@@ -33,6 +34,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <string>
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
@@ -1097,7 +1101,16 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Clock::now();
 		if (total_wait.count() > 0) {
-			Common::Thread::SleepNano(static_cast<uint64_t>(total_wait.count()));
+			if (KnobFile("early") == 0) {
+				Common::Thread::SleepNano(static_cast<uint64_t>(total_wait.count()));
+			} else {
+				// To try (~/.config/KytyPS5-Native/vrr, early=1): a ready flip is shown at once, not at the next tick.
+				const auto until = sleep_begin + total_wait;
+				while (!token.stop_requested() && Clock::now() < until) {
+					Common::Thread::SleepNano(300000);
+					m_flip_queue.Flip();
+				}
+			}
 		}
 		if (token.stop_requested()) {
 			break;
@@ -2350,6 +2363,10 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	PRINT_NAME();
 
 	LOGF("\trate = %d\n", rate);
+	static std::atomic_int rate_traced {0};
+	if (rate_traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::fprintf(stderr, "vrr: set flip rate handle %d rate %d, from %p\n", handle, rate, __builtin_return_address(0));
+	}
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -2404,6 +2421,10 @@ KYTY_SYSV_ABI int VideoOutAddPreVblankStartEvent(LibKernel::EventQueue::KernelEq
 KYTY_SYSV_ABI int VideoOutAddOutputModeEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                              void* udata) {
 	PRINT_NAME();
+	static std::atomic_int mode_event_traced {0};
+	if (mode_event_traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::fprintf(stderr, "vrr: add output mode event handle %d, from %p\n", handle, __builtin_return_address(0));
+	}
 	return RegisterVideoOutEvent(handle, eq, VideoOutEventKind::OutputMode, udata);
 }
 
@@ -3165,6 +3186,37 @@ KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 	return OK;
 }
 
+uint64_t VrrKnob(const char* key) {
+	return KnobFile(key);
+}
+
+// The game's code around a call's return address, to read what it does with the answer: 160 bytes
+// before and 32 after, for the first two calls of each `what`.
+void VrrDumpCode(const char* what, const void* ret) {
+	static std::mutex                                     mutex;
+	static std::array<std::pair<std::string, int>, 16>  seen {};
+	{
+		std::scoped_lock lock(mutex);
+		auto*            slot = std::find_if(seen.begin(), seen.end(), [&](const auto& e) { return e.first == what; });
+		if (slot == seen.end()) {
+			slot = std::find_if(seen.begin(), seen.end(), [](const auto& e) { return e.first.empty(); });
+		}
+		if (slot == seen.end() || slot->second >= 2) {
+			return;
+		}
+		slot->first = what;
+		slot->second++;
+	}
+	const auto* p = static_cast<const uint8_t*>(ret) - 160;
+	std::string hex;
+	for (int i = 0; i < 192; i++) {
+		char b[4];
+		std::snprintf(b, sizeof(b), "%02x", p[i]);
+		hex += b;
+	}
+	std::fprintf(stderr, "vrr: code %s: return address %p, bytes from -160: %s\n", what, ret, hex.c_str());
+}
+
 KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status) {
 	PRINT_NAME();
 
@@ -3198,11 +3250,25 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
 	         ? VIDEO_OUT_REFRESH_RATE_119_88HZ
 	         : VIDEO_OUT_REFRESH_RATE_59_94HZ);
-	status->flags       = 0;
+	status->flags       = VrrKnob("flags");
 	status->reserved[0] = 0;
 	status->reserved[1] = 0;
 	status->reserved[2] = 0;
 	ctx->mutex.Unlock();
+
+	static std::atomic_int reads {0};
+	const int              nth = reads.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (nth <= 2) {
+		VrrDumpCode("output status read", __builtin_return_address(0));
+	}
+	if (nth <= 8 || nth % 300 == 0) {
+		std::fprintf(stderr,
+		             "vrr: output status read #%d handle %d, from %p: resolution %u dynamicRange %u refreshRate %" PRIu64
+		             " flags 0x%" PRIx64 "\n",
+		             nth, handle, __builtin_return_address(0), static_cast<unsigned>(status->resolution),
+		             static_cast<unsigned>(status->dynamicRange), static_cast<uint64_t>(status->refreshRate),
+		             static_cast<uint64_t>(status->flags));
+	}
 
 	return OK;
 }
@@ -3224,6 +3290,12 @@ KYTY_SYSV_ABI int VideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t 
 		     "\t arg2   = 0x%016" PRIx64 "\n",
 		     handle, arg1, arg2);
 	}
+	static std::atomic_int traced {0};
+	if (traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::fprintf(stderr, "vrr: peg to fixed rate handle %d arg1 0x%" PRIx64 " arg2 0x%" PRIx64 ", from %p\n",
+		             handle, arg1, arg2, __builtin_return_address(0));
+		VrrDumpCode("peg", __builtin_return_address(0));
+	}
 
 	return OK;
 }
@@ -3234,6 +3306,10 @@ KYTY_SYSV_ABI int VideoOutVrrUnpegFromFixedRate(int handle) {
 	static std::atomic_bool logged {false};
 	if (!logged.exchange(true, std::memory_order_relaxed)) {
 		LOGF("\t handle = %d\n", handle);
+	}
+	static std::atomic_int traced {0};
+	if (traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::fprintf(stderr, "vrr: unpeg from fixed rate handle %d, from %p\n", handle, __builtin_return_address(0));
 	}
 
 	return OK;
@@ -3283,6 +3359,18 @@ KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
 	PRINT_NAME();
 
 	LOGF("\t mode = 0x%016" PRIx64 "\n", mode);
+	static std::atomic_int supported_traced {0};
+	if (supported_traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		char hex[sizeof(VideoOutOutputOptions) * 3 + 1] = {};
+		if (options != nullptr) {
+			for (size_t i = 0; i < sizeof(VideoOutOutputOptions); i++) {
+				std::snprintf(hex + i * 3, 4, "%02x ", reinterpret_cast<const uint8_t*>(options)[i]);
+			}
+		}
+		std::fprintf(stderr, "vrr: is output supported handle %d mode 0x%" PRIx64 " options %s, from %p\n", handle, mode,
+		             hex, __builtin_return_address(0));
+		VrrDumpCode("is output supported", __builtin_return_address(0));
+	}
 
 	int result = ValidateOutputConfig(handle, mode, options, reserved_ptr, reserved);
 	if (result != OK) {
