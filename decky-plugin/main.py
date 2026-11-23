@@ -621,6 +621,34 @@ def _present_mode(tid):
     return word if word in PRESENT_MODES + ("Immediate",) else PRESENT_MODES[0]
 
 
+def _display_copy(tid):
+    """The game's copy mode: the digit in its file when the launch wrapper takes it, else the default."""
+    try:
+        with open(os.path.join(DISPLAY_COPY_DIR, tid)) as f:
+            word = "".join(f.readline().split())
+    except OSError:
+        return DISPLAY_COPY_MODES[0]
+    return word if word in DISPLAY_COPY_MODES else DISPLAY_COPY_MODES[0]
+
+
+def _display_copy_write(tid, mode):
+    """The file the wrapper reads; none for the default."""
+    path = os.path.join(DISPLAY_COPY_DIR, tid)
+    if mode == DISPLAY_COPY_MODES[0]:
+        if os.path.lexists(path):
+            os.remove(path)
+        return
+    _mkdir_user(DISPLAY_COPY_DIR)
+    tmp = path + ".tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    # Root writes in the user's folder: never through a link put there.
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644), "w") as f:
+        f.write(mode + "\n")
+    os.replace(tmp, path)
+    os.lchown(path, *_ids())
+
+
 def _present_mode_write(tid, mode):
     """The file the wrapper reads; none for the default."""
     path = os.path.join(PRESENT_DIR, tid)
@@ -1268,6 +1296,7 @@ class Plugin:
             # False while the game's executable is still being read for the first time.
             "addons_known": bool(entry) and entry.get("key") == _addon_key(g["path"]),
             "present_mode": _present_mode(title_id),
+            "display_copy": _display_copy(title_id),
             "game_running": _game_running(),
         }
 
@@ -1293,6 +1322,17 @@ class Plugin:
             await asyncio.to_thread(_present_mode_write, title_id, mode)
         except OSError as e:
             decky.logger.exception("present mode file")
+            return {"ok": False, "log": str(e)}
+        return {"ok": True}
+
+    async def set_display_copy(self, title_id, mode):
+        # The title id names the file: one of a game here, never a path.
+        if mode not in DISPLAY_COPY_MODES or not title_id or os.path.basename(title_id) != title_id or title_id in (".", ".."):
+            return {"ok": False, "log": "not a copy mode of a game"}
+        try:
+            await asyncio.to_thread(_display_copy_write, title_id, mode)
+        except OSError as e:
+            decky.logger.exception("display copy file")
             return {"ok": False, "log": str(e)}
         return {"ok": True}
 
