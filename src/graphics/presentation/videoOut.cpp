@@ -3224,6 +3224,11 @@ KYTY_SYSV_ABI int VideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t 
 		     "\t arg2   = 0x%016" PRIx64 "\n",
 		     handle, arg1, arg2);
 	}
+	static std::atomic_int traced {0};
+	if (traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::fprintf(stderr, "vrr: peg to fixed rate handle %d arg1 0x%" PRIx64 " arg2 0x%" PRIx64 ", from %p\n",
+		             handle, arg1, arg2, __builtin_return_address(0));
+	}
 
 	return OK;
 }
@@ -3234,6 +3239,10 @@ KYTY_SYSV_ABI int VideoOutVrrUnpegFromFixedRate(int handle) {
 	static std::atomic_bool logged {false};
 	if (!logged.exchange(true, std::memory_order_relaxed)) {
 		LOGF("\t handle = %d\n", handle);
+	}
+	static std::atomic_int traced {0};
+	if (traced.fetch_add(1, std::memory_order_relaxed) < 40) {
+		std::fprintf(stderr, "vrr: unpeg from fixed rate handle %d, from %p\n", handle, __builtin_return_address(0));
 	}
 
 	return OK;
