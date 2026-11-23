@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <span>
@@ -1144,6 +1145,11 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t f
 
 	// The host's real speakers: a 5.1 or larger device reports a 7.1 layout (FL FR C LFE BL BR
 	// SL SR), which SDL folds down to what the device has; anything smaller stays stereo.
+	static std::atomic_int speaker_logs {0};
+	if (speaker_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::fprintf(stderr, "audio: AudioOut2GetSpeakerInfo: host device %d ch, game told %s\n", DetectedOutputChannels(),
+		             ReportedOutputChannels() >= 8 ? "7.1 (8 speakers)" : "stereo");
+	}
 	if (ReportedOutputChannels() >= 8) {
 		info->available_bits = 0xFF;
 		static constexpr AudioOut2SpeakerAngle ANGLES[8] = {{-30, 0}, {30, 0},   {0, 0},    {0, 0},

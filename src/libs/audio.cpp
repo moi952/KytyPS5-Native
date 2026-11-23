@@ -16,8 +16,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <magic_enum.hpp>
+#include <string>
 #include <vector>
 
 namespace Libs::Audio {
@@ -69,12 +71,14 @@ static bool audio_out_port_type_is_valid(int type) {
 } // namespace
 
 static std::atomic_int g_device_channels {0};
+// Output streams a port has open. While one is, SDL reports the format that stream opened the device with,
+// so the hardware's channels cannot be read again and the value read before is kept.
+static std::atomic_int g_open_streams {0};
 
 int DetectedOutputChannels(bool refresh) {
-	if (!refresh) {
-		if (const int cached = g_device_channels.load(std::memory_order_relaxed); cached > 0) {
-			return cached;
-		}
+	const int cached = g_device_channels.load(std::memory_order_relaxed);
+	if (cached > 0 && (!refresh || g_open_streams.load(std::memory_order_relaxed) > 0)) {
+		return cached;
 	}
 
 	// SDL counts init calls, so this leaves a running output port's audio subsystem alone.
@@ -311,6 +315,9 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 		return false;
 	}
 
+	// Read the hardware's channels before this stream opens the device with its own.
+	(void)DetectedOutputChannels();
+
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
 	desired.format   = SdlFormat(port->format);
@@ -323,6 +330,7 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return false;
 	}
+	g_open_streams.fetch_add(1, std::memory_order_relaxed);
 	if (!SDL_ResumeAudioStreamDevice(port->stream)) {
 		LOGF("AudioOut: SDL_ResumeAudioStreamDevice failed: %s\n", SDL_GetError());
 		CloseSdlDevice(port);
@@ -336,12 +344,14 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	    device_frames > 0 && device_spec.freq > 0) {
 		port->device_period_s = static_cast<double>(device_frames) / device_spec.freq;
 	}
-	if (device_spec.channels > 0) {
-		g_device_channels.store(device_spec.channels, std::memory_order_relaxed);
-	}
+	// device_spec is not kept as the host's channel count: once a stream opens the device, SDL reports the
+	// format it was opened with (the first port's, often stereo), not the hardware's.
 
 	LOGF("AudioOut: opened SDL stream (%d Hz, %d ch, format 0x%04x)\n", desired.freq,
 	     desired.channels, static_cast<unsigned>(desired.format));
+	// In the game's log, which LOGF does not reach: what the port asked for, and what the hardware has.
+	std::fprintf(stderr, "audio: SDL stream opened, %d Hz, %d ch asked, host device %d ch (read before the open), device now %d ch\n",
+	             desired.freq, desired.channels, g_device_channels.load(std::memory_order_relaxed), device_spec.channels);
 	return true;
 }
 
@@ -353,6 +363,7 @@ void Audio::CloseSdlDevice(PortOut* port) {
 	if (port->stream != nullptr) {
 		SDL_DestroyAudioStream(port->stream);
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+		g_open_streams.fetch_sub(1, std::memory_order_relaxed);
 	}
 	port->stream = nullptr;
 }
@@ -981,6 +992,8 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 	}
 
 	LOGF("\t param   = %u (format=%u, %s)\n", param, format_param, magic_enum::enum_name(format));
+	std::fprintf(stderr, "audio: AudioOutOpen type %d, %u frames, %u Hz, format %u (%s)\n", type, len, freq,
+	             format_param, std::string(magic_enum::enum_name(format)).c_str());
 
 	EXIT_NOT_IMPLEMENTED(format == Audio::Format::Unknown);
 
@@ -1045,6 +1058,11 @@ int KYTY_SYSV_ABI AudioOutGetPortState(int handle, AudioOutPortState* state) {
 		default: EXIT("unknown port type: %d\n", type);
 	}
 
+	static std::atomic_int state_logs {0};
+	if (state_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::fprintf(stderr, "audio: AudioOutGetPortState type %d: port has %d ch, host device %d ch, game told %d ch\n",
+		             type, channels_num, DetectedOutputChannels(), static_cast<int>(state->channel));
+	}
 	LOGF("\t output  = %" PRIu16 "\n"
 	     "\t channel = %" PRIu8 "\n",
 	     state->output, state->channel);

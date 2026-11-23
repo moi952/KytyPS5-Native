@@ -2541,6 +2541,9 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	     buffer_index_start, buffer_num, set_index, attribute->pixel_format, attribute->tiling_mode,
 	     attribute->aspect_ratio, attribute->width, attribute->height, attribute->pitch_in_pixel,
 	     attribute->option, category);
+	std::fprintf(stderr, "hdr: VideoOutRegisterBuffers2: pixel format 0x%016" PRIx64 " (%s), %ux%u\n", attribute->pixel_format,
+	             Graphics::IsHdrVideoOutPixelFormat(attribute->pixel_format) ? "HDR" : "SDR", attribute->width,
+	             attribute->height);
 
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
@@ -3184,6 +3187,13 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	status->resolution =
 	    ((attribute3 & 4) != 0 && driver.width < 3840 && driver.height < 2160 ? 1u : 2u);
 	status->dynamicRange = (attribute & 0x20000000) != 0 && driver.IsHdrSupported() ? 2u : 1u;
+	// In the game's log: why a game's HDR option is greyed out (it reads dynamicRange 1).
+	static std::atomic_int status_logs {0};
+	if (status_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
+		std::fprintf(stderr, "hdr: VideoOutGetOutputStatus: ATTRIBUTE 0x%08x (HDR bit %s), HDR swapchain %s -> dynamicRange %u\n",
+		             static_cast<unsigned>(attribute), (attribute & 0x20000000) != 0 ? "set" : "NOT set",
+		             driver.IsHdrSupported() ? "supported" : "NOT supported", static_cast<unsigned>(status->dynamicRange));
+	}
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
 	         ? VIDEO_OUT_REFRESH_RATE_119_88HZ
