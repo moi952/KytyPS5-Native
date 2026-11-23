@@ -54,7 +54,7 @@ const DISPLAY_COPY_MODES: [string, string][] = [
 
 // The audio output's channels offered for a game: [what the plugin's backend takes, its name here].
 const AUDIO_MODES: [string, string][] = [
-  ["global", "Same as for every game"],
+  ["global", "Global setting"],
   ["auto", "Auto (the output device)"],
   ["2", "Stereo"],
   ["6", "5.1"],

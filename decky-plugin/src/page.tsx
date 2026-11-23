@@ -148,6 +148,32 @@ function DisplayTab({ view, state }: { view: PluginView; state: State }) {
         />
       </DialogControlsSection>
       <DialogControlsSection>
+        <DialogControlsSectionHeader>Animations</DialogControlsSectionHeader>
+        {(["boot", "exit"] as const).map((kind) => (
+          <ToggleField
+            key={kind}
+            label={kind === "boot" ? "Boot animation" : "Exit animation"}
+            description={kind === "boot" ? "Before the game starts" : "When you leave the game"}
+            checked={state.videos[kind]}
+            disabled={!!busy}
+            onChange={(on) =>
+              run("Video", async () => {
+                const r = await setVideo(kind, on);
+                if (!r.ok) toast(r.log || "failed");
+              })
+            }
+          />
+        ))}
+      </DialogControlsSection>
+    </Scroll>
+  );
+}
+
+function AudioTab({ view, state }: { view: PluginView; state: State }) {
+  const { busy, run } = view;
+  return (
+    <Scroll>
+      <DialogControlsSection>
         <DialogControlsSectionHeader>Audio</DialogControlsSectionHeader>
         <DropdownItem
           label="Output channels"
@@ -165,24 +191,6 @@ function DisplayTab({ view, state }: { view: PluginView; state: State }) {
             })
           }
         />
-      </DialogControlsSection>
-      <DialogControlsSection>
-        <DialogControlsSectionHeader>Animations</DialogControlsSectionHeader>
-        {(["boot", "exit"] as const).map((kind) => (
-          <ToggleField
-            key={kind}
-            label={kind === "boot" ? "Boot animation" : "Exit animation"}
-            description={kind === "boot" ? "Before the game starts" : "When you leave the game"}
-            checked={state.videos[kind]}
-            disabled={!!busy}
-            onChange={(on) =>
-              run("Video", async () => {
-                const r = await setVideo(kind, on);
-                if (!r.ok) toast(r.log || "failed");
-              })
-            }
-          />
-        ))}
       </DialogControlsSection>
     </Scroll>
   );
@@ -209,6 +217,7 @@ export function Page() {
         tabs={[
           { id: "games", title: "Games", content: <GamesTab view={view} state={state} /> },
           { id: "display", title: "Display", content: <DisplayTab view={view} state={state} /> },
+          { id: "audio", title: "Audio", content: <AudioTab view={view} state={state} /> },
         ]}
       />
     </Screen>
