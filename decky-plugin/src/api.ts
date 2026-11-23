@@ -32,6 +32,8 @@ export interface State {
   gone: Record<string, { appid: number }>;
   videos: Record<string, boolean>;
   hdr: boolean;
+  // The refresh rate Kyty gives every game, in Hz: "60" (its default), "90" or "120".
+  vblank: string;
   // The audio output's channels for every game: "auto" (what the device reports), "2", "6" or "8".
   audio: string;
   kernel: { items: KernelItem[]; method: "files" | "rpm-ostree" | "limine" | "unsupported"; ours: boolean; reboot: boolean; all_ok: boolean };
@@ -74,6 +76,8 @@ export interface GameInfo {
   addons_known: boolean;
   // How Kyty hands the game's frames to the display: Mailbox (Kyty's default), Fifo, or Immediate set by hand.
   present_mode: string;
+  // The game's own refresh rate: "global" (the setting for every game), "60", "90" or "120".
+  vblank: string;
   // How Kyty copies the game's video-out buffers before showing them: "2" (default), "0" none, "1" all.
   display_copy: string;
   // The game's own audio channels: "global" (the setting for every game), "auto", "2", "6" or "8".
@@ -121,6 +125,8 @@ export const getGame = callable<[titleId: string], GameInfo | null>("get_game");
 export const setAddon = callable<[titleId: string, label: string, on: boolean], Result>("set_addon");
 export const findAddons = callable<[titleId: string], Result>("find_addons");
 export const setPresentMode = callable<[titleId: string, mode: string], Result>("set_present_mode");
+export const setVblank = callable<[titleId: string, rate: string], Result>("set_vblank");
+export const setVblankDefault = callable<[rate: string], Result>("set_vblank_default");
 export const setDisplayCopy = callable<[titleId: string, mode: string], Result>("set_display_copy");
 export const setAudio = callable<[titleId: string, mode: string], Result>("set_audio");
 export const setAudioDefault = callable<[mode: string], Result>("set_audio_default");
