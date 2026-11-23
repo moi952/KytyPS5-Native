@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <magic_enum.hpp>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -75,10 +76,49 @@ static std::atomic_int g_device_channels {0};
 // so the hardware's channels cannot be read again and the value read before is kept.
 static std::atomic_int g_open_streams {0};
 
+// The physical device opens with the spec of the first logical device on it: a stereo first stream
+// (the game's system sounds) would leave every later 8 ch stream mixed down to 2. A logical device of
+// the host's channels, opened before any stream and kept, holds the device at them. It holds one SDL
+// audio init of its own.
+static std::mutex         g_holder_mutex;
+static SDL_AudioDeviceID  g_holder = 0;
+
+static void ReleaseHolder() {
+	std::lock_guard lock(g_holder_mutex);
+	if (g_holder != 0) {
+		SDL_CloseAudioDevice(g_holder);
+		g_holder = 0;
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+	}
+}
+
+static void EnsureHolder(int freq) {
+	std::lock_guard lock(g_holder_mutex);
+	const int       host = g_device_channels.load(std::memory_order_relaxed);
+	if (g_holder != 0 || host <= 2 || !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+		return;
+	}
+	SDL_AudioSpec hold {};
+	hold.freq     = freq;
+	hold.format   = SDL_AUDIO_F32;
+	hold.channels = host;
+	g_holder      = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &hold);
+	std::fprintf(stderr, "audio: device held open at %d ch: %s\n", host,
+	             g_holder != 0 ? "ok" : SDL_GetError());
+	if (g_holder == 0) {
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+	}
+}
+
 int DetectedOutputChannels(bool refresh) {
 	const int cached = g_device_channels.load(std::memory_order_relaxed);
 	if (cached > 0 && (!refresh || g_open_streams.load(std::memory_order_relaxed) > 0)) {
 		return cached;
+	}
+	// With no stream open, the hardware can be read again (the output may have changed) once the
+	// holder, which would report its own format, is released; the next port holds the device again.
+	if (refresh) {
+		ReleaseHolder();
 	}
 
 	// SDL counts init calls, so this leaves a running output port's audio subsystem alone.
@@ -95,6 +135,7 @@ int DetectedOutputChannels(bool refresh) {
 
 	if (found > 0) {
 		g_device_channels.store(found, std::memory_order_relaxed);
+		EnsureHolder(48000);
 	}
 	return found;
 }
@@ -263,6 +304,9 @@ void Initialize() {
 	EXIT_IF(g_audio != nullptr);
 
 	g_audio = new Audio;
+	// Before anything else (the pad's haptics, sounds of the system) opens the output with its own
+	// format: read the hardware's channels and hold the device at them.
+	(void)DetectedOutputChannels();
 }
 
 void Shutdown() {
@@ -317,6 +361,8 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 
 	// Read the hardware's channels before this stream opens the device with its own.
 	(void)DetectedOutputChannels();
+
+	EnsureHolder(static_cast<int>(port->freq));
 
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);

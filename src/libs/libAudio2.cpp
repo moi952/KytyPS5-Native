@@ -1143,18 +1143,19 @@ int KYTY_SYSV_ABI AudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t f
 	info->type  = 0;
 	info->flags = 0;
 
-	// The host's real speakers: a 5.1 or larger device reports a 7.1 layout (FL FR C LFE BL BR
-	// SL SR), which SDL folds down to what the device has; anything smaller stays stereo.
+	// The host's real speakers, in the order FL FR C LFE BL BR SL SR: 8 only for a device that has
+	// them (7.1), 6 for a 5.1 one, else stereo. (The ports still take 8 channels: 5.1 is sent in them.)
+	const int host     = DetectedOutputChannels();
+	const int speakers = host >= 8 ? 8 : (host >= 6 ? 6 : 2);
 	static std::atomic_int speaker_logs {0};
 	if (speaker_logs.fetch_add(1, std::memory_order_relaxed) < 8) {
-		std::fprintf(stderr, "audio: AudioOut2GetSpeakerInfo: host device %d ch, game told %s\n", DetectedOutputChannels(),
-		             ReportedOutputChannels() >= 8 ? "7.1 (8 speakers)" : "stereo");
+		std::fprintf(stderr, "audio: AudioOut2GetSpeakerInfo: host device %d ch, game told %d speakers\n", host, speakers);
 	}
-	if (ReportedOutputChannels() >= 8) {
-		info->available_bits = 0xFF;
+	if (speakers > 2) {
+		info->available_bits = (1u << speakers) - 1;
 		static constexpr AudioOut2SpeakerAngle ANGLES[8] = {{-30, 0}, {30, 0},   {0, 0},    {0, 0},
 		                                                    {-135, 0}, {135, 0}, {-90, 0}, {90, 0}};
-		std::copy(std::begin(ANGLES), std::end(ANGLES), info->speaker_angle);
+		std::copy(ANGLES, ANGLES + speakers, info->speaker_angle);
 	} else {
 		info->available_bits   = 0x03;
 		info->speaker_angle[0] = {-30, 0};

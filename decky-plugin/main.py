@@ -56,6 +56,10 @@ PATCHES_DIR = os.path.join(CONFIG_DIR, "patches")
 # the wrapper also takes Immediate, written by hand.
 PRESENT_DIR = os.path.join(CONFIG_DIR, "present-mode")
 PRESENT_MODES = ("Mailbox", "Fifo")
+# A game's display buffer copy mode (KYTY_NATIVE_GPU_DISPLAY_COPY), a file per title id holding the
+# digit, there only while the game does not use the default ("2"): read by the launch wrapper.
+DISPLAY_COPY_DIR = os.path.join(CONFIG_DIR, "display-copy")
+DISPLAY_COPY_MODES = ("2", "0", "1")
 PATCH_CACHE = os.path.join(decky.DECKY_PLUGIN_RUNTIME_DIR, "patches")
 PATCH_SOURCE = "https://raw.githubusercontent.com/TeeKay87/HEN-Cheats-Collection/master/cheats/"
 # Sony's PS5 boot and shutdown animations: not ours to ship, fetched from where fans host them.
