@@ -36,6 +36,8 @@ export interface State {
   vblank: string;
   // The audio output's channels for every game: "auto" (what the device reports), "2", "6" or "8".
   audio: string;
+  // The other Decky plugins: `keep` is on when one is left running while a game plays (the others are turned off).
+  plugins: { name: string; keep: boolean }[];
   kernel: { items: KernelItem[]; method: "files" | "rpm-ostree" | "limine" | "unsupported"; ours: boolean; reboot: boolean; all_ok: boolean };
   game_running: boolean;
 }
@@ -130,6 +132,7 @@ export const setVblankDefault = callable<[rate: string], Result>("set_vblank_def
 export const setDisplayCopy = callable<[titleId: string, mode: string], Result>("set_display_copy");
 export const setAudio = callable<[titleId: string, mode: string], Result>("set_audio");
 export const setAudioDefault = callable<[mode: string], Result>("set_audio_default");
+export const setPluginKeep = callable<[name: string, keep: boolean], Result>("set_plugin_keep");
 export const getPatches = callable<[titleId: string, again: boolean], Patches>("get_patches");
 // With no name and `on` false: all of them off.
 export const setPatch = callable<[titleId: string, name: string, on: boolean], Result>("set_patch");
