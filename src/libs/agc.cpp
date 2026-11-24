@@ -1,5 +1,7 @@
 #include "libs/agc.h"
 #include "libs/agcDiff.h"
+#include "graphics/native_gpu/nativePassCapture.h"
+#include "graphics/native_gpu/nativeUpscaler.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -17,6 +19,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/native_gpu/nativeShadow.h"
+#include "graphics/native_gpu/nativeShaderPatches.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
@@ -96,6 +99,7 @@ void Initialize() {
 	NativeGpu::ShadowSetHost([](int event_id, uint32_t context_id) { g_renderer->TriggerInterrupt(event_id, context_id); },
 	                         [] { return Sync::ReadReferenceClock(); });
 	NativeGpu::ShadowSetFlipHost([](int handle, int index, int flip_mode, int64_t flip_arg) {
+		NativePassCapture::NoteFlip(4);
 		g_renderer->GetGpu().SubmitEopFlip(handle, index, flip_mode, flip_arg);
 	});
 	// The GPU order of the flip releases so far, for the WaitUntilSafeForRendering pads of a native
@@ -708,14 +712,18 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	EXIT_NOT_IMPLEMENTED(h->file_header != 0x34333231);
 	EXIT_NOT_IMPLEMENTED(h->version != 0x00000018);
 
-	auto base = reinterpret_cast<uint64_t>(code);
+	uint32_t native_code_size = 0;
+	if (!NativeGpu::PrepareNativeShader(h, &native_code_size)) {
+		return GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM;
+	}
+	auto base = reinterpret_cast<uint64_t>(h->code);
 
 	ShaderMappedData map;
 	map.type                = static_cast<Prospero::ShaderBinaryType>(h->type);
 	map.user_data           = h->user_data;
 	map.input_semantics     = h->input_semantics;
 	map.num_input_semantics = h->num_input_semantics;
-	map.code_size_bytes     = h->shader_size;
+	map.code_size_bytes     = native_code_size ? native_code_size : h->shader_size;
 	map.scratch_size_dwords = h->scratch_size_dw_per_thread;
 
 	ShaderMapUserData(base, map);
@@ -1986,6 +1994,10 @@ uint32_t* KYTY_SYSV_ABI AgcCbDispatch(CommandBuffer* buf, uint32_t thread_group_
 	if (buf == nullptr) {
 		return nullptr;
 	}
+
+	NativeUpscaler::CaptureHost(reinterpret_cast<uint64_t>(__builtin_return_address(0)),
+	                            reinterpret_cast<uint64_t>(__builtin_frame_address(0)),
+	                            reinterpret_cast<uint64_t>(buf->cursor_up));
 
 	auto* cmd = buf->AllocateDW(5);
 

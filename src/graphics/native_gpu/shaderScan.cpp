@@ -413,6 +413,12 @@ private:
 				}
 				if (op == 0x21u) { // s_swappc_b64: a call through a register (fetch shaders); it returns here
 					Add(ScanKind::IndirectBranch, ScanSeverity::Info, enc, op, 0, dw, w);
+					// ... unless the return address goes to null: a jump to the program's next part (the front half
+					// of a split shader, Marvel's Wolverine's fetch shaders). What follows is data, not code.
+					if (((w >> 16u) & 0x7fu) == 0x7du) {
+						m_r.legacy.ended = true;
+						return Flow::Stop;
+					}
 				}
 				break;
 			case ScanEnc::MIMG:

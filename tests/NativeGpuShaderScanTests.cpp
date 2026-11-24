@@ -424,6 +424,18 @@ void TestReporter() {
 	std::fclose(out);
 }
 
+// A swappc whose return address goes to null is a jump to the program's next part (Marvel's Wolverine's fetch shaders):
+// what follows it is data. Decoding that data found v_dot2c encodings and decode errors, which made the patcher refuse
+// 834 of the game's shaders and their creation fail.
+void TestSwappcToNull() {
+	constexpr uint32_t SSwappcNull = 0xbefd2106u; // s_swappc_b64 null, s[6:7] (as the game writes it)
+	const auto tail = Scan({VMov, SSwappcNull, VDot2c, 0xffffffffu, 0xffffffffu}, 5);
+	Check(!tail.truncated && !tail.decode_error && tail.Count(ScanKind::Dot2c) == 0 && tail.instructions == 2,
+	      "s_swappc_b64 null ends the path: the data after it is not scanned");
+	Check(tail.Count(ScanKind::IndirectBranch) == 1, "the tail jump is still an indirect branch");
+	const auto call = Scan({SSwappc, VDot2c, SEndpgm}, 3);
+	Check(call.Count(ScanKind::Dot2c) == 1 && call.instructions == 3, "a swappc with a return register returns to the next word");
+}
 } // namespace
 
 int main() {
@@ -438,6 +450,7 @@ int main() {
 	TestPcRel();
 	TestLegacyParity();
 	TestReporter();
+	TestSwappcToNull();
 	std::puts("NativeGpuShaderScanTests: all cases passed");
 	return 0;
 }

@@ -97,6 +97,7 @@ jobs:
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
+            -DKYTY_NATIVE_UPSCALER=ON \
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \

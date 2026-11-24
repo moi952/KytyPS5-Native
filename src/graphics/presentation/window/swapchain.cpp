@@ -17,13 +17,16 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/directPresent.h"
+#include "graphics/presentation/window/frameGen.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -37,10 +40,14 @@ struct Presenter::Frame {
 	VulkanImage   image;
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
+	uint64_t      last_acquire = 0; // the pool's acquisition count when this frame was last handed out
 	bool          busy         = false;
 	uint32_t      source_flags = 0;
 	bool          blank        = false;
+	uint64_t      fg_boundary  = 0; // frame generation: the boundary whose guides are this frame's (SetFrameGuides)
 
+	[[nodiscard]] bool IsHdr() const { return (source_flags & 4u) != 0; }
+	[[nodiscard]] bool IsLinear() const { return (source_flags & 8u) != 0; }
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
@@ -102,7 +109,25 @@ public:
 			*compatible = m_free.back();
 		}
 		m_free.pop_back();
-		frame->busy = true;
+		frame->busy         = true;
+		frame->last_acquire = ++m_acquisitions;
+		// Idle frames of another size or format (the startup's blank frames in the swapchain's format, a mode the
+		// title left) give their image back after ~2 s unused: each is a whole frame of GPU memory, which is RAM here.
+		std::vector<Presenter::Frame*> stale;
+		for (auto* f: m_free) {
+			if (f->image.image != nullptr && m_acquisitions - f->last_acquire > 120 &&
+			    (f->image.format != format || f->image.extent.width != extent.width || f->image.extent.height != extent.height) &&
+			    m_scheduler.IsFree(f->present_tick)) {
+				stale.push_back(f);
+			}
+		}
+		for (auto* f: stale) {
+			std::fprintf(stderr, "presenter: idle %ux%u frame (format %d) freed\n", f->image.extent.width, f->image.extent.height,
+			             static_cast<int>(f->image.format));
+			m_window.graphic_ctx.device.destroyImageView(f->view, nullptr);
+			f->view = nullptr;
+			m_window.graphic_ctx.DeleteImage(f->image); // (image.image null: the next Configure recreates it)
+		}
 		m_mutex.Unlock();
 
 		m_scheduler.Wait(frame->present_tick);
@@ -125,6 +150,7 @@ private:
 	std::vector<std::unique_ptr<Presenter::Frame>> m_frames;
 	std::vector<Presenter::Frame*>                 m_free;
 	vk::Format                                     m_format = vk::Format::eUndefined;
+	uint64_t                                       m_acquisitions = 0;
 };
 
 void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
@@ -132,14 +158,18 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 		EXIT("unsupported prepared frame, extent=%ux%u format=%d\n", extent.width, extent.height,
 		     static_cast<int>(format));
 	}
-	auto&      dst        = image;
+	auto&      dst     = image;
+	const auto features = graphics.GetFormatProperties(format).optimalTilingFeatures;
+	// While frame generation is on every frame can be its output (a storage image); real frames keep the
+	// usage too, so the pool does not reallocate between the two.
+	const bool storage    = FrameGen::Enabled() && static_cast<bool>(features & vk::FormatFeatureFlagBits::eStorageImage);
 	const bool compatible = dst.image != nullptr && dst.extent.width == extent.width &&
-	                        dst.extent.height == extent.height && dst.format == format;
+	                        dst.extent.height == extent.height && dst.format == format &&
+	                        (!storage || static_cast<bool>(dst.usage & vk::ImageUsageFlagBits::eStorage));
 	if (compatible) {
 		return;
 	}
 
-	const auto features = graphics.GetFormatProperties(format).optimalTilingFeatures;
 	const auto required =
 	    vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eSampledImageFilterLinear |
 	    vk::FormatFeatureFlagBits::eSampledImage | vk::FormatFeatureFlagBits::eTransferSrc |
@@ -166,6 +196,9 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	create.initialLayout = vk::ImageLayout::eUndefined;
 	create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
 	               vk::ImageUsageFlagBits::eSampled;
+	if (storage) {
+		create.usage |= vk::ImageUsageFlagBits::eStorage;
+	}
 	create.sharingMode = vk::SharingMode::eExclusive;
 	create.samples     = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, dst)) {
@@ -220,8 +253,18 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
-	                  vk::ImageLayout::eTransferDstOptimal, copy);
+	if (source.backing.format == vk::Format::eA2R10G10B10UnormPack32 && image.format == vk::Format::eA2B10G10R10UnormPack32) {
+		vk::ImageBlit blit {};
+		blit.srcSubresource = copy.srcSubresource;
+		blit.dstSubresource = copy.dstSubresource;
+		blit.srcOffsets[1] = vk::Offset3D {static_cast<int32_t>(copy.extent.width), static_cast<int32_t>(copy.extent.height), 1};
+		blit.dstOffsets[1] = blit.srcOffsets[1];
+		command.blitImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+	} else {
+		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, copy);
+	}
 }
 
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
@@ -353,6 +396,38 @@ struct Presenter::Impl {
 	}
 	void Present();
 
+	// Frame generation 2x (window/frameGen.h): a flip shows the generated frame and leaves its real frame
+	// here for the next VideoOut tick (PresentPendingReal), one vblank later.
+	bool TryFrameGen(Frame& real);
+	bool PresentPendingReal();
+	// Dynamic frame generation (FrameGen::Dynamic): real frames are queued as they arrive, on vblank ticks; each tick
+	// shows the content of `tick - (M - 1)`, M the longest recent gap between real frames in ticks: a real frame
+	// when one is there, else one generated at that point between the two around it. 60 real frames a second
+	// (M = 1) show as they come; 30 (M = 2) is 2x; 20 (M = 3) 3x; 45 fills every third vblank.
+	struct FgReal {
+		Frame*                  frame = nullptr;
+		uint64_t                tick  = 0;
+		bool                    guides_ok = false;
+		NativeUpscaler::FgFrame guides {};
+	};
+	bool EnqueueDynamic(Frame& real);
+	bool DynamicTick();
+	void FlushDynamic();
+	void ShowFrame(Frame* f); // makes `f` the main layer and presents it
+	void Unref(Frame* f);     // back to the pool unless queued or shown
+	bool Queued(const Frame* f) const {
+		for (const auto& r: fg_reals) {
+			if (r.frame == f) return true;
+		}
+		return false;
+	}
+	void DropPendingReal() {
+		if (fg_real != nullptr) {
+			frames.Release(fg_real);
+			fg_real = nullptr;
+		}
+	}
+
 	RenderContext&        renderer;
 	WindowContext&        window;
 	Swapchain             swapchain;
@@ -364,6 +439,17 @@ struct Presenter::Impl {
 	// Direct flips completed as FLIP since the last Vulkan present.
 	std::atomic<uint32_t> direct_streak {0};
 	std::atomic_bool      hdr_ever {false};
+	std::unique_ptr<FrameGen::Generator> fg;
+	Frame*                               fg_real = nullptr;
+	std::deque<FgReal>                   fg_reals;            // dynamic: arrived real frames, the newest last
+	std::deque<uint64_t>                 fg_gaps;             // their recent arrival gaps, in ticks
+	uint64_t                             fg_tick   = 0;       // DynamicTick count
+	const Frame*                         fg_pair_a = nullptr; // the pair the generator holds (last Advance)
+	const Frame*                         fg_pair_b = nullptr;
+	bool                                 fg_was_dynamic = false;
+	// A flip frame generation could not pair (no guides yet, a history reset): shown again at the next tick
+	// all the same, so the title keeps the 2x cadence (half the refresh rate) and stays paired from then on.
+	bool                                 fg_repeat = false;
 	// Last, so it is destroyed first: its event thread stops before anything else goes.
 	std::unique_ptr<DirectPresenter> direct;
 };
@@ -1012,11 +1098,17 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	switch (frame_format) {
 		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
 		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
+		case vk::Format::eA2R10G10B10UnormPack32:
+			// FSR's Vulkan backend accepts A2B10G10R10. Convert the displayed channels on the GPU rather than
+			// reinterpreting the bits (which swaps red/blue), so Astro can use the same interpolation path.
+			if (FrameGen::Enabled() && !headset) frame_format = vk::Format::eA2B10G10R10UnormPack32;
+			break;
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
 	frame->source_flags = VideoOutSourceFlags(video_out_format);
 	frame->blank        = false;
+	frame->fg_boundary  = 0;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -1041,6 +1133,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
 	frame->source_flags = 0;
 	frame->blank        = true;
+	frame->fg_boundary  = 0;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1058,6 +1151,12 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 
 bool Presenter::PresentLastFrame() {
 	Common::LockGuard lock(m_impl->present_mutex);
+	// Overlay refreshes only present what is on screen. Flushing here would break dynamic frame
+	// generation's pair chain on nearly every vblank. The upstream window loop no longer exposes
+	// a guest-paused state, so there is no pause-specific flush in this path.
+	if (m_impl->PresentPendingReal()) {
+		return true;
+	}
 	if (m_impl->layers[0].frame == nullptr && m_impl->layers[1].frame == nullptr) {
 		return false;
 	}
@@ -1086,6 +1185,24 @@ void Presenter::Present(Frame& frame) {
 
 void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
+	auto&             impl = *m_impl;
+	static uint64_t fg_present_inputs = 0;
+	if (FrameGen::Enabled() && (++fg_present_inputs <= 3 || fg_present_inputs % 600 == 0)) {
+		std::fprintf(stderr, "[frame generation] present layers=%zu first_bus=%d active=%d\n", layers.size(),
+		             layers.empty() ? -1 : layers[0].bus, FrameGen::Active() ? 1 : 0);
+	}
+	if (impl.fg != nullptr) {
+		impl.fg->Retire([&](uint64_t tick) { return impl.present_scheduler.IsFree(tick); });
+	}
+	// A real frame still waiting for its tick goes first (a flip came before it), then this one.
+	(void)impl.PresentPendingReal();
+	if (layers.size() == 1 && layers[0].bus == 0 && layers[0].frame != nullptr && impl.EnqueueDynamic(*layers[0].frame)) {
+		return; // shown by DynamicTick, on this vblank or a later one
+	}
+	impl.FlushDynamic();
+	if (layers.size() == 1 && layers[0].bus == 0 && layers[0].frame != nullptr && impl.TryFrameGen(*layers[0].frame)) {
+		return;
+	}
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
 		auto& previous = m_impl->layers[layer.bus];
@@ -1097,11 +1214,19 @@ void Presenter::Present(std::span<const Layer> layers) {
 	m_impl->Present();
 }
 
+void Presenter::SetFrameGuides(Frame& frame, uint64_t boundary) {
+	frame.fg_boundary = boundary;
+}
+
 void Presenter::ClearLayer(int bus) {
 	if (static_cast<size_t>(bus) >= m_impl->layers.size()) {
 		return;
 	}
 	Common::LockGuard lock(m_impl->present_mutex);
+	if (bus == 0) {
+		m_impl->DropPendingReal();
+		m_impl->FlushDynamic();
+	}
 	auto& layer = m_impl->layers[bus];
 	if (layer.frame != nullptr) {
 		m_impl->frames.Release(layer.frame);
@@ -1120,7 +1245,7 @@ void Presenter::Impl::Present() {
 	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
 	const auto* main_frame = layers[0].frame;
 	const bool hdr_changed = main_frame != nullptr && !main_frame->blank &&
-	                         swapchain.SetHdr((main_frame->source_flags & 4u) != 0);
+	                         swapchain.SetHdr(main_frame->IsHdr());
 	if (!swapchain.Exists()) {
 		// Released while direct flips ran; this present (menu, toast, fallback flip) needs it again.
 		swapchain.Create();
@@ -1177,6 +1302,326 @@ void Presenter::Discard(Frame& frame) {
 	m_impl->frames.Release(&frame);
 }
 
+bool Presenter::PresentPendingFrame() {
+	Common::LockGuard lock(m_impl->present_mutex);
+	return m_impl->PresentPendingReal();
+}
+
+bool Presenter::FrameGenTick() {
+	Common::LockGuard lock(m_impl->present_mutex);
+	return m_impl->DynamicTick();
+}
+
+static void CountFgPresent(bool generated);
+// Dynamic mode diagnostics, printed with the cadence line: ticks, ticks between two real frames (interpolation
+// wanted), and why none was made (no guides for the pair, Advance failed, a priming generation).
+static struct {
+	uint64_t ticks, between, wanted, no_guides, advance_failed, advances, resets, priming, gaps[5], untagged, arrived;
+} g_dyn {};
+
+void Presenter::Impl::Unref(Frame* f) {
+	if (f != nullptr && f != layers[0].frame && f != fg_real && !Queued(f)) {
+		frames.Release(f);
+	}
+}
+
+void Presenter::Impl::ShowFrame(Frame* f) {
+	Frame* old = layers[0].frame;
+	layers[0]  = {f, 0, false};
+	if (old != f) {
+		Unref(old);
+	}
+	Present();
+}
+
+// Leaves dynamic mode: the newest queued frame is shown, the rest go back (with their guides).
+void Presenter::Impl::FlushDynamic() {
+	if (fg_reals.empty()) {
+		return;
+	}
+	Frame* newest = fg_reals.back().frame;
+	for (auto& r: fg_reals) {
+		if (r.guides_ok && fg != nullptr) fg->DropGuides(r.guides);
+	}
+	std::vector<Frame*> queued;
+	for (auto& r: fg_reals) queued.push_back(r.frame);
+	fg_reals.clear();
+	fg_gaps.clear();
+	fg_pair_a = fg_pair_b = nullptr;
+	Frame* previously_shown = layers[0].frame;
+	const bool replaced = newest != previously_shown;
+	if (replaced) ShowFrame(newest); // releases the previous layer after the queue was detached
+	for (Frame* f: queued) {
+		if (!replaced || f != previously_shown) Unref(f); // that queued layer was already released by ShowFrame
+	}
+}
+
+// A flip's real frame in dynamic mode (`real` owned: busy). False: not this mode or not such a frame.
+bool Presenter::Impl::EnqueueDynamic(Frame& real) {
+	if (!FrameGen::Dynamic() || !FrameGen::Active()) {
+		if (fg_was_dynamic) {
+			FlushDynamic();
+			fg.reset(); // the 2x mode or none: its own generator, fresh
+			fg_was_dynamic = false;
+		}
+		return false;
+	}
+	if (real.blank || !(real.image.usage & vk::ImageUsageFlagBits::eSampled)) {
+		return false;
+	}
+	if (!fg_was_dynamic) {
+		fg.reset();
+		fg_was_dynamic = true;
+	}
+	if (fg == nullptr) {
+		fg = std::make_unique<FrameGen::Generator>(window.graphic_ctx);
+	}
+	FgReal r {&real, fg_tick + 1, false, {}};
+	g_dyn.arrived++;
+	g_dyn.untagged += real.fg_boundary == 0 ? 1 : 0;
+	r.guides_ok = fg->TakeGuides(&r.guides, real.fg_boundary);
+	if (!fg_reals.empty()) {
+		fg_gaps.push_back(std::max<uint64_t>(1, r.tick - fg_reals.back().tick));
+		while (fg_gaps.size() > 8) fg_gaps.pop_front();
+	}
+	fg_reals.push_back(r);
+	while (fg_reals.size() > 4) { // (a stall: the oldest can no longer be shown)
+		FgReal old = fg_reals.front();
+		fg_reals.pop_front();
+		if (old.guides_ok) fg->DropGuides(old.guides);
+		Unref(old.frame);
+	}
+	return true;
+}
+
+// Once per vblank (VideoOut PresentThread, after its flips): presents what dynamic mode shows on this vblank.
+bool Presenter::Impl::DynamicTick() {
+	fg_tick++;
+	g_dyn.ticks++;
+	if (fg_reals.empty()) {
+		return false;
+	}
+	if (fg != nullptr) {
+		fg->Retire([&](uint64_t tick) { return present_scheduler.IsFree(tick); });
+	}
+	uint64_t gap = 1;
+	for (const uint64_t g: fg_gaps) gap = std::max(gap, g);
+	gap                 = std::min<uint64_t>(gap, 4);
+	const uint64_t tau  = fg_tick - (gap - 1); // the content time this vblank shows, in ticks
+	// A: the newest real frame at or before tau; B: the one after it.
+	size_t a = 0;
+	for (size_t i = 0; i < fg_reals.size(); i++) {
+		if (fg_reals[i].tick <= tau) a = i;
+	}
+	while (a > 0) { // older frames can no longer be shown
+		FgReal old = fg_reals.front();
+		fg_reals.pop_front();
+		a--;
+		if (old.guides_ok && fg != nullptr) fg->DropGuides(old.guides);
+		if (old.frame == fg_pair_a || old.frame == fg_pair_b) {
+			// still the generator's pair: keep nothing (a later pair starts over if it does not follow)
+		}
+		Unref(old.frame);
+	}
+	FgReal&        A       = fg_reals[0];
+	FgReal*        B       = fg_reals.size() >= 2 ? &fg_reals[1] : nullptr;
+	CommandBuffer* command = nullptr;
+	const bool     usable  = fg != nullptr && FrameGen::Active() && B != nullptr && A.frame->image.extent == B->frame->image.extent &&
+	                    A.frame->image.format == B->frame->image.format && A.frame->source_flags == B->frame->source_flags;
+	const vk::Extent2D extent = B != nullptr ? vk::Extent2D {B->frame->image.extent.width, B->frame->image.extent.height} : vk::Extent2D {};
+	FrameGen::Target   bt {}, at {};
+	if (B != nullptr) {
+		bt = {B->frame->image.image, B->frame->image.format, extent, B->frame->image.usage, B->frame->fg_boundary, B->frame->IsLinear()};
+		at = {A.frame->image.image, A.frame->image.format, extent, A.frame->image.usage, A.frame->fg_boundary, A.frame->IsLinear()};
+	}
+	// The generator follows every pair in order, as soon as its second frame is here, generating or not: optical flow
+	// and FSR's history need each frame (a pair of back-to-back frames, which needs no generated frame, included).
+	bool ready = B != nullptr && fg_pair_a == A.frame && fg_pair_b == B->frame;
+	if (usable && !ready && !B->guides_ok) g_dyn.no_guides++;
+	if (usable && !ready && B->guides_ok) {
+		command            = &present_scheduler.BeginCommand();
+		const bool follows = fg_pair_b == A.frame;
+		B->frame->Transit(command->Handle(), vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+		A.frame->Transit(command->Handle(), vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
+		fg->SetHdr(B->frame->IsHdr());
+		ready = fg->Advance(command->Handle(), follows ? &at : nullptr, bt, B->guides, !follows);
+		g_dyn.advances++;
+		g_dyn.resets += follows ? 0 : 1;
+		g_dyn.advance_failed += ready ? 0 : 1;
+		B->guides_ok = false; // read (or released) by Advance
+		fg_pair_a    = ready ? A.frame : nullptr;
+		fg_pair_b    = ready ? B->frame : nullptr;
+	}
+	// What this vblank shows: the real frame at tau, a generated one between A and B, or the nearer real one.
+	const bool  between = B != nullptr && tau > A.tick;
+	const float phase   = between ? static_cast<float>(tau - A.tick) / static_cast<float>(B->tick - A.tick) : 0.0f;
+	const bool  wanted  = between && phase > 0.08f && phase < 0.92f; // (near a real frame: that frame)
+	if (between) {
+		g_dyn.between++;
+		g_dyn.wanted += wanted ? 1 : 0;
+		g_dyn.gaps[std::min<uint64_t>(B->tick - A.tick, 4)]++;
+	}
+	Frame* generated = nullptr;
+	bool   shown     = false;
+	bool   dumping   = false;
+	if (usable && ready && wanted) {
+		if (command == nullptr) command = &present_scheduler.BeginCommand();
+		generated        = frames.Acquire(extent, B->frame->image.format);
+		generated->source_flags = B->frame->source_flags;
+		generated->blank        = false;
+		generated->fg_boundary  = 0;
+		generated->Configure(window.graphic_ctx, extent, B->frame->image.format);
+		B->frame->Transit(command->Handle(), vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
+		generated->Transit(command->Handle(), vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite);
+		const FrameGen::Target ot {generated->image.image, generated->image.format, extent, generated->image.usage};
+		shown = (generated->image.usage & vk::ImageUsageFlagBits::eStorage) && fg->Generate(command->Handle(), bt, ot, phase);
+		dumping = shown && fg->DumpRecord(command->Handle(), bt, ot);
+		generated->image.state = {vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite, vk::ImageLayout::eGeneral};
+	}
+	if (command != nullptr) {
+		const uint64_t tick = present_scheduler.Submit();
+		fg->Submitted(tick);
+		if (dumping) { present_scheduler.Wait(tick); fg->DumpWrite(); }
+		A.frame->present_tick = std::max(A.frame->present_tick, tick); // read by this submission
+		B->frame->present_tick = std::max(B->frame->present_tick, tick);
+		if (generated != nullptr) {
+			generated->present_tick = tick;
+		}
+	}
+	if (shown) {
+		ShowFrame(generated);
+		CountFgPresent(true);
+		return true;
+	}
+	if (generated != nullptr) {
+		g_dyn.priming++;
+		frames.Release(generated);
+	}
+	Frame* real = !between || phase < 0.5f ? A.frame : B->frame;
+	if (layers[0].frame == real) {
+		return false;
+	}
+	ShowFrame(real);
+	CountFgPresent(false);
+	return true;
+}
+
+// Frame generation's cadence, every 5 s on stderr: generated and real frames presented.
+static void CountFgPresent(bool generated) {
+	static uint64_t gen = 0, real = 0;
+	static auto     since = std::chrono::steady_clock::now();
+	(generated ? gen : real)++;
+	const auto now = std::chrono::steady_clock::now();
+	if (const double s = std::chrono::duration<double>(now - since).count(); s >= 5.0) {
+		std::fprintf(stderr, "[frame generation] %.1f s: %llu generated + %llu real presents (%.1f + %.1f per second)\n", s,
+		             static_cast<unsigned long long>(gen), static_cast<unsigned long long>(real), gen / s, real / s);
+		if (g_dyn.ticks != 0) {
+			std::fprintf(stderr,
+			             "[frame generation] dynamic: %llu ticks, %llu between frames (%llu wanted), gaps 1:%llu 2:%llu 3:%llu 4+:%llu; "
+			             "%llu advances (%llu resets, %llu failed), %llu without guides, %llu priming; %llu frames, %llu untagged\n",
+			             (unsigned long long)g_dyn.ticks, (unsigned long long)g_dyn.between, (unsigned long long)g_dyn.wanted,
+			             (unsigned long long)g_dyn.gaps[1], (unsigned long long)g_dyn.gaps[2], (unsigned long long)g_dyn.gaps[3],
+			             (unsigned long long)g_dyn.gaps[4], (unsigned long long)g_dyn.advances, (unsigned long long)g_dyn.resets,
+			             (unsigned long long)g_dyn.advance_failed, (unsigned long long)g_dyn.no_guides, (unsigned long long)g_dyn.priming,
+			             (unsigned long long)g_dyn.arrived, (unsigned long long)g_dyn.untagged);
+			g_dyn = {};
+		}
+		gen = real = 0;
+		since      = now;
+	}
+}
+
+bool Presenter::Impl::PresentPendingReal() {
+	if (fg_real == nullptr) {
+		if (fg_repeat && layers[0].frame != nullptr) {
+			fg_repeat = false;
+			Present();
+			return true;
+		}
+		fg_repeat = false;
+		return false;
+	}
+	CountFgPresent(false);
+	auto& main = layers[0];
+	if (main.frame != nullptr && main.frame != fg_real) {
+		frames.Release(main.frame);
+	}
+	main    = {fg_real, 0, false};
+	fg_real = nullptr;
+	Present();
+	return true;
+}
+
+// Called with present_mutex held and `real` this flip's main-bus frame (owned: busy).
+bool Presenter::Impl::TryFrameGen(Frame& real) {
+	if (!FrameGen::Active()) {
+		fg.reset(); // off or paused: its FidelityFX contexts and images go (about 200 MB; RAM is scarce here)
+		return false;
+	}
+	if (fg == nullptr) {
+		fg = std::make_unique<FrameGen::Generator>(window.graphic_ctx);
+	}
+	static uint64_t fg_inputs = 0;
+	if (++fg_inputs <= 3 || fg_inputs % 600 == 0) {
+		std::fprintf(stderr, "[frame generation] input %llu: format=%u hdr=%u blank=%u usage=0x%x guides=%llu\n",
+		             static_cast<unsigned long long>(fg_inputs), static_cast<unsigned>(real.image.format), real.IsHdr() ? 1u : 0u,
+		             real.blank ? 1u : 0u, static_cast<unsigned>(static_cast<VkImageUsageFlags>(real.image.usage)),
+		             static_cast<unsigned long long>(real.fg_boundary));
+	}
+	if (real.blank || !(real.image.usage & vk::ImageUsageFlagBits::eSampled)) {
+		fg->Reset();
+		return false;
+	}
+	fg->SetHdr(real.IsHdr());
+	const vk::Extent2D extent {real.image.extent.width, real.image.extent.height};
+	auto&              command = present_scheduler.BeginCommand();
+	real.Transit(command.Handle(), vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+	const FrameGen::Target source {real.image.image, real.image.format, extent, real.image.usage, real.fg_boundary, real.IsLinear()};
+	Frame*                 generated = nullptr;
+	bool                   shown     = false;
+	bool                   dumping   = false;
+	if (fg->Begin(command.Handle(), source)) {
+		generated        = frames.Acquire(extent, real.image.format);
+		generated->source_flags = real.source_flags;
+		generated->blank        = false;
+		generated->fg_boundary  = 0;
+		generated->Configure(window.graphic_ctx, extent, real.image.format);
+		real.Transit(command.Handle(), vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
+		generated->Transit(command.Handle(), vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite);
+		const FrameGen::Target output {generated->image.image, generated->image.format, extent, generated->image.usage};
+		shown = (generated->image.usage & vk::ImageUsageFlagBits::eStorage) && fg->Record(command.Handle(), source, output);
+		dumping = shown && fg->DumpRecord(command.Handle(), source, output); // (diagnostic, KYTY_FRAMEGEN_DUMP)
+		generated->image.state = {vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+		                          vk::ImageLayout::eGeneral};
+	}
+	// (Submitted even when nothing was generated: the recorded transitions are the frames' tracked state.)
+	const uint64_t tick = present_scheduler.Submit();
+	fg->Submitted(tick);
+	if (dumping) {
+		present_scheduler.Wait(tick);
+		fg->DumpWrite();
+	}
+	if (generated != nullptr) {
+		generated->present_tick = tick;
+	}
+	if (!shown) {
+		if (generated != nullptr) {
+			frames.Release(generated);
+		}
+		fg_repeat = true; // (the caller presents `real` now; the next tick shows it again)
+		return false;
+	}
+	auto& main = layers[0];
+	if (main.frame != nullptr) {
+		frames.Release(main.frame);
+	}
+	main = {generated, 0, false};
+	Present();
+	CountFgPresent(true);
+	fg_real = &real;
+	return true;
+}
+
 DirectPresenter* Presenter::Direct() const noexcept {
 	return m_impl->direct.get();
 }
@@ -1214,6 +1659,12 @@ void Presenter::MaintainDirect() {
 
 void Presenter::SetMainLayer(Frame& frame) {
 	Common::LockGuard lock(m_impl->present_mutex);
+	if (m_impl->fg_real != &frame) {
+		m_impl->DropPendingReal();
+	} else {
+		m_impl->fg_real = nullptr;
+	}
+	m_impl->FlushDynamic();
 	auto& main = m_impl->layers[0];
 	if (main.frame != nullptr && main.frame != &frame) {
 		m_impl->frames.Release(main.frame);

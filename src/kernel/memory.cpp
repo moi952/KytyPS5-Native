@@ -1,5 +1,7 @@
 #include "kernel/memory.h"
 
+#include "kernel/mappedCount.h"
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -726,6 +728,9 @@ private:
 	// Track backing ownership while a transaction changes views before publishing VirtualRanges.
 	// Names, protections and memory types live only in VirtualRanges. Physical offsets may alias.
 	std::map<uint64_t, Mapping> m_mappings;
+	// Views per direct-memory offset, kept with m_mappings (Map, Unmap): ReclaimAutomatic asks it what is still
+	// mapped instead of walking every mapping.
+	MappedCount m_mapped_count;
 };
 
 class FlexibleMemory {
@@ -1402,7 +1407,6 @@ void PhysicalMemory::ReclaimAutomatic(uint64_t start, uint64_t size) {
 	if (owner != m_physical.begin()) {
 		--owner;
 	}
-	bool automatic = false;
 	for (; owner != m_physical.end() && owner->first < end; ++owner) {
 		const auto& block = owner->second;
 		if (block.kind != AllocationKind::Automatic || block.start_addr + block.size <= start) {
@@ -1410,17 +1414,14 @@ void PhysicalMemory::ReclaimAutomatic(uint64_t start, uint64_t size) {
 		}
 		const auto first = std::max(start, block.start_addr);
 		const auto last  = std::min(end, block.start_addr + block.size);
-		AddFreeRange(m_automatic_free, first, last - first);
-		automatic = true;
-	}
-	if (automatic) {
-		for (const auto& [vaddr, mapping]: m_mappings) {
-			const auto first = std::max(start, mapping.start_addr);
-			const auto last  = std::min(end, mapping.start_addr + mapping.size);
-			if (first < last) {
-				RemoveFreeRange(m_automatic_free, first, last - first);
+		// Free what no view maps any more; what another view still maps stays out of the free list.
+		MappedCountForEach(m_mapped_count, first, last - first, [this](uint64_t piece, uint64_t piece_size, uint32_t views) {
+			if (views == 0) {
+				AddFreeRange(m_automatic_free, piece, piece_size);
+			} else {
+				RemoveFreeRange(m_automatic_free, piece, piece_size);
 			}
-		}
+		});
 	}
 }
 
@@ -1466,6 +1467,7 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len) {
 	}
 
 	m_mappings.emplace_hint(next, vaddr, Mapping {phys_addr, len});
+	MappedCountAdjust(m_mapped_count, phys_addr, len, 1);
 	RemoveFreeRange(m_automatic_free, phys_addr, len);
 	return true;
 }
@@ -1562,6 +1564,7 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size) {
 	while (first != last) {
 		const auto removed = first->second;
 		first              = m_mappings.erase(first);
+		MappedCountAdjust(m_mapped_count, removed.start_addr, removed.size, -1);
 		ReclaimAutomatic(removed.start_addr, removed.size);
 	}
 	return true;

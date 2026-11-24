@@ -716,6 +716,7 @@ if(BUILD_TESTING)
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
+	add_test(NAME gpu_blit_shader COMMAND $<TARGET_FILE:gpu_blit_shader_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
@@ -836,6 +837,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		gpu_blit_shader_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -876,6 +878,7 @@ if(BUILD_TESTING)
 		http_uri_parse_tests
 		rtc_tests
 		playgo_tests
+		psml_tests
 	)
 endif()
 
@@ -900,6 +903,22 @@ include("${KYTY_SOURCE_DIR}/graphics/native_gpu/nativeGpu.cmake")
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
 configure_macos_guest_address_space(kyty_emulator)
+
+# BC-250 fork: the native HLX upscaler and FSR 3 frame generation (graphics/native_gpu/nativeUpscaler.cpp,
+# graphics/presentation/window/frameGen.cpp, AMD FidelityFX SDK in 3rdparty/fidelityfx). OFF: the plain emulator.
+option(KYTY_NATIVE_UPSCALER "Build the BC-250 native upscaler and FSR 3 frame generation" OFF)
+if(KYTY_NATIVE_UPSCALER AND LINUX)
+	add_subdirectory("${KYTY_THIRD_PARTY_DIR}/fidelityfx" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/fidelityfx")
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_ENABLE_EXPERIMENTAL_NATIVE_UPSCALER=1)
+	target_link_libraries(kyty_emulator kyty_fidelityfx)
+endif()
+# BC-250 fork, release packages: link against the libm of an older distribution (a directory holding its libm.so,
+# e.g. a symlink to SteamOS's libm.so.6) so the binary also runs on that glibc. Only libm's newest symbol versions
+# (sqrtf, sinh, ... at GLIBC_2.43/2.44 on current Arch) are above what the C library itself needs.
+set(KYTY_COMPAT_LIBM_DIR "" CACHE PATH "Directory with an older distribution's libm.so to link against")
+if(KYTY_COMPAT_LIBM_DIR)
+	target_link_options(kyty_emulator PRIVATE "-L${KYTY_COMPAT_LIBM_DIR}")
+endif()
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
 add_custom_target(kyty_trophy_sound

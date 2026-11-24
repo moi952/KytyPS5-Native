@@ -65,6 +65,20 @@
 #include <x86intrin.h>
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && defined(__x86_64__)
+#define KYTY_TSC_GPU_LOCK_SUPPORTED 1
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <drm/amdgpu_drm.h>
+#include <drm/drm.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#else
+#define KYTY_TSC_GPU_LOCK_SUPPORTED 0
+#endif
+
 #ifdef pthread_attr_getguardsize
 #undef pthread_attr_getguardsize
 #endif
@@ -143,6 +157,110 @@ static uint64_t KernelHostTsc() {
 #endif
 }
 
+#if KYTY_TSC_GPU_LOCK_SUPPORTED
+// On the PS5 the CPU's TSC and the GPU's clock (what s_memrealtime and the timestamps of RELEASE_MEM/COPY_DATA read)
+// count one reference: the TSC makes 16 ticks per GPU tick, from the same zero. Games compute GPU-side deadlines from
+// the TSC: Marvel's Wolverine writes a target time for a one-group compute shader that spins on s_memrealtime until it
+// (at most one flip interval). On an AMD APU the GPU's clock is the hardware counter, also locked to the TSC: on the
+// BC-250 exactly 32 TSC ticks per GPU tick from the same zero. The wall-clock calibration of the TSC gave 3194.03 MHz
+// instead (the reference runs 0.19 % under its 100 MHz), so every TSC -> GPU time conversion ran ahead by 0.19 % of the
+// uptime (5.4 s after 48 min) and Wolverine's pacer waited its full limit each frame (15 fps in Fidelity, 30-40 in
+// Performance). The TSC rate is therefore measured against the GPU's clock (amdgpu's TIMESTAMP query reads the counter
+// s_memrealtime reads): sceKernelGetTscFrequency, the process time and Kyty's 100 MHz reference clock then count the
+// GPU's time. KYTY_TSC_GPU_LOCK=0: the wall-clock rate, as before.
+namespace {
+
+struct GpuClockSample {
+	uint64_t tsc    = 0; // the middle of the read
+	uint64_t gpu    = 0;
+	uint64_t window = 0; // TSC ticks the read took
+};
+
+bool ReadGpuClock(int fd, uint64_t* value) {
+	drm_amdgpu_info request {};
+	request.return_pointer = reinterpret_cast<uintptr_t>(value);
+	request.return_size    = sizeof(*value);
+	request.query          = AMDGPU_INFO_TIMESTAMP;
+	return ::ioctl(fd, DRM_IOCTL_AMDGPU_INFO, &request) == 0;
+}
+
+// The tightest of a few (TSC, GPU clock, TSC) reads.
+bool SampleGpuClock(int fd, GpuClockSample* out) {
+	bool got = false;
+	for (int i = 0; i < 16; i++) {
+		uint64_t       gpu    = 0;
+		const uint64_t before = __rdtsc();
+		if (!ReadGpuClock(fd, &gpu)) {
+			return false;
+		}
+		const uint64_t after = __rdtsc();
+		if (!got || after - before < out->window) {
+			*out = {before + (after - before) / 2, gpu, after - before};
+			got  = true;
+		}
+	}
+	return got;
+}
+
+// TSC ticks per second of the GPU's clock, or 0 (no amdgpu device, KYTY_TSC_GPU_LOCK=0, or a reading that makes no sense).
+uint64_t TscFrequencyFromGpuClock(uint64_t wall_frequency) {
+	if (const char* v = std::getenv("KYTY_TSC_GPU_LOCK"); v != nullptr && v[0] == '0') {
+		return 0;
+	}
+	const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		return 0;
+	}
+	drm_amdgpu_info_device dev {};
+	drm_amdgpu_info        request {};
+	request.return_pointer = reinterpret_cast<uintptr_t>(&dev);
+	request.return_size    = sizeof(dev);
+	request.query          = AMDGPU_INFO_DEV_INFO;
+	GpuClockSample a;
+	GpuClockSample b;
+	bool           ok = ::ioctl(fd, DRM_IOCTL_AMDGPU_INFO, &request) == 0 && dev.gpu_counter_freq != 0 && SampleGpuClock(fd, &a);
+	if (ok) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		ok = SampleGpuClock(fd, &b);
+	}
+	::close(fd);
+	if (!ok || b.gpu <= a.gpu || b.tsc <= a.tsc) {
+		return 0;
+	}
+	const long double gpu_hz = static_cast<long double>(dev.gpu_counter_freq) * 1000.0L; // gpu_counter_freq is in kHz
+	long double       ratio  = static_cast<long double>(b.tsc - a.tsc) / static_cast<long double>(b.gpu - a.gpu);
+	// One reference clock: the TSC is a whole multiple of it (32 on the BC-250). 100 ms of reads are good to about 1e-5.
+	const long double whole = std::round(ratio);
+	const bool        exact = whole >= 1.0L && std::fabs(ratio - whole) < whole * 1e-4L;
+	if (exact) {
+		ratio = whole;
+	}
+	const auto frequency = static_cast<uint64_t>(ratio * gpu_hz + 0.5L);
+	// The GPU's reference keeps within a percent of the wall clock (spread spectrum takes it down by a fraction of one).
+	if (wall_frequency != 0 && std::fabs(static_cast<long double>(frequency) - static_cast<long double>(wall_frequency)) >
+	                               static_cast<long double>(wall_frequency) * 0.01L) {
+		std::fprintf(stderr, "kernel: TSC not locked to the GPU clock: %" PRIu64 " Hz by it, %" PRIu64 " Hz by the wall clock\n",
+		             frequency, wall_frequency);
+		return 0;
+	}
+	// Where the GPU's clock stands against TSC / ratio. The guest reads the TSC directly (RDTSC), so a difference here
+	// stays in every deadline it computes for the GPU.
+	const long double zero_us = (static_cast<long double>(b.gpu) - static_cast<long double>(b.tsc) / ratio) / gpu_hz * 1e6L;
+	std::fprintf(stderr,
+	             "kernel: TSC locked to the GPU clock: %.6Lf TSC ticks per GPU tick%s, %" PRIu64 " Hz (wall clock %" PRIu64
+	             " Hz); GPU clock - TSC = %.1Lf us\n",
+	             ratio, exact ? " (whole)" : "", frequency, wall_frequency, zero_us);
+	if (std::fabs(zero_us) > 1000.0L) {
+		std::fprintf(stderr, "kernel: the GPU clock does not start with the TSC: GPU deadlines the guest computes from the TSC are "
+		                     "off by %.1Lf ms\n",
+		             zero_us / 1000.0L);
+	}
+	return frequency;
+}
+
+} // namespace
+#endif
+
 static uint64_t KernelHostTscFrequency() {
 	static const uint64_t frequency = [] {
 #if defined(_M_X64) || defined(__x86_64__)
@@ -160,7 +278,13 @@ static uint64_t KernelHostTscFrequency() {
 		                                        static_cast<long double>(NANOS_PER_SEC) /
 		                                        static_cast<long double>(host_end - host_start));
 		static constexpr uint64_t ROUND_TO = 100000;
-		return (freq + ROUND_TO / 2) / ROUND_TO * ROUND_TO;
+		const uint64_t            wall     = (freq + ROUND_TO / 2) / ROUND_TO * ROUND_TO;
+#if KYTY_TSC_GPU_LOCK_SUPPORTED
+		if (const uint64_t locked = TscFrequencyFromGpuClock(wall); locked != 0) {
+			return locked;
+		}
+#endif
+		return wall;
 #else
 		return NANOS_PER_SEC;
 #endif

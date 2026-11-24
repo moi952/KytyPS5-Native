@@ -1,6 +1,7 @@
 #include "common/knobFile.h"
 #include "graphics/presentation/gameMenu.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/native_gpu/nativePassCapture.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -20,6 +21,7 @@
 #include "graphics/native_gpu/nativeShadow.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/native_gpu/nativeUpscaler.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/directPresent.h"
@@ -837,6 +839,7 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	    (buffer.data_address & 65535u) != 0) {
 		EXIT("invalid video-out surface footprint or alignment\n");
 	}
+	NativeUpscaler::FgAddDisplayBuffer(buffer.data_address, info.data.size); // (frame generation: whose image a flip shows)
 	// Natively rendered display buffers hold plain pixels (ShadowDisplayWithoutDcc).
 	if (compression != Graphics::VideoOutCompression::Uncompressed &&
 	    Graphics::NativeGpu::ShadowDisplayWithoutDcc(buffer.data_address, info.data.size)) {
@@ -1120,7 +1123,14 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		total_wait -= frame_begin - sleep_begin;
 
 		VblankBegin();
-		bool presented = m_flip_queue.Flip();
+		// Frame generation 2x: the real frame whose generated frame the previous tick showed comes first;
+		// a flip waiting meanwhile is shown at the next tick (so the title runs at half the refresh rate).
+		bool presented = m_presenter.PresentPendingFrame();
+		if (!presented) {
+			presented = m_flip_queue.Flip();
+			// Dynamic frame generation: a flip only queued its frame; this vblank's image is presented here.
+			presented = m_presenter.FrameGenTick() || presented;
+		}
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh() && OverlayFrameReady()) {
 			if (!m_presenter.PresentLastFrame()) {
 				m_presenter.Present(m_presenter.PrepareBlankFrame(width, height, true));
@@ -1530,6 +1540,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		const auto prepare_t0 = std::chrono::steady_clock::now();
 		frame = &m_presenter.PrepareFrame(buffer, source_info, video_out_format, headset);
+		m_presenter.SetFrameGuides(*frame, NativeUpscaler::FgFlipGuides(source_info.data.address, index));
 		Graphics::NativeGpu::ShadowFlipStats(
 		    std::chrono::duration<double>(std::chrono::steady_clock::now() - prepare_t0).count());
 		if (headset) {
@@ -1707,6 +1718,9 @@ bool FlipQueue::TakeEopFlip(uint32_t ctx, uint64_t& request_id) {
 			// between saw no EOP order yet and cleared it. With the order given, Flip leaves the label alone.
 			if (queue == &m_requests && request->index >= 0 && request->index < VIDEO_OUT_BUFFER_NUM_MAX) {
 				std::atomic_ref<uint64_t>(request->cfg->labels[request->index]).store(1, std::memory_order_release);
+				// Frame generation: this interrupt comes from the label tracker in GPU order, as the tracker's flip points do,
+				// so the last boundary before it is this flip's frame's (titles flip this way through libSceAgc's SetFlip).
+				NativeUpscaler::FgNoteFlip(request->index);
 			}
 			if (LogFlips()) {
 				std::fprintf(stderr, "flip [%.2f] %" PRIu64 ": end-of-pipe interrupt 0x%08" PRIx32 "\n", FlipLogMs(),
@@ -2828,6 +2842,7 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 }
 
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
+	NativePassCapture::NoteFlip(1); // (KYTY_PASS_CAPTURE: frames are counted by flip requests)
 	PRINT_NAME();
 
 	auto&     driver     = DriverState();
@@ -2853,6 +2868,7 @@ KYTY_SYSV_ABI int VideoOutSubmitEopFlip(int handle, int index, int flip_mode, in
                                         uint32_t* ctx) {
 	PRINT_NAME();
 	EXIT_IF(g_video_out_driver == nullptr);
+	NativePassCapture::NoteFlip(3); // (libSceAgc's SetFlip: the flip most titles use)
 
 	const int result = g_video_out_driver->SubmitEopFlip(handle, index, flip_mode, flip_arg, ctx, false);
 	if (result == VIDEO_OUT_ERROR_INVALID_FLIP_MODE) {
@@ -2878,6 +2894,7 @@ KYTY_SYSV_ABI int VideoOutGetBufferLabelAddress(int handle, void** address) {
 
 int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handle, int index,
                                       int flip_mode, int64_t flip_arg, uint64_t& request_id) {
+	NativePassCapture::NoteFlip(2);
 	EXIT_IF(buffer.IsInvalid());
 
 	const int result = ReserveFlipRequest(*m_impl, handle, index, flip_mode, flip_arg,

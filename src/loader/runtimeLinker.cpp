@@ -7,6 +7,7 @@
 #include "common/file.h"
 #include "common/fpEnv.h"
 #include "common/hostException.h"
+#include "loader/demonsScreamRecovery.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
 #include "common/profiler.h"
@@ -670,6 +671,9 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && defined(__x86_64__)
+	if (DemonsScreamRecovery::TryRecoverDemonsScreamAssert(info)) return true;
+#endif
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
@@ -1413,6 +1417,21 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	auto* libc = Common::File::IsFileExisting(libc_path) ? LoadProgram(libc_path) : nullptr;
 	RelocateAll();
 
+#if defined(KYTY_ENABLE_EXPERIMENTAL_NATIVE_UPSCALER)
+	// Profile-derived render presets apply before the title constructs its render graph. Keep this plan separate
+	// from the user's cheats, so their original file remains the source of live cheat selections.
+	if (const char* preset = std::getenv("KYTY_RENDER_PRESET_PATCH"); preset != nullptr && *preset != '\0') {
+		if (!GamePatch::Apply(preset, m_programs.empty() ? nullptr : m_programs.front(), m_programs)) {
+			EXIT("Failed to apply render preset\n");
+		}
+		const auto applied = GamePatch::ListCheats();
+		if (applied.empty() || std::any_of(applied.begin(), applied.end(), [](const auto& c) { return !c.applied; })) {
+			EXIT("Render preset did not match the loaded executable\n");
+		}
+		GamePatch::Clear(); // these writes are all within the module; no live cheats or code caves to retain
+	}
+#endif
+
 	if (!game_patch.empty()) {
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
 		                      m_programs)) {
@@ -1946,6 +1965,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		LOGF("tls_handler_size       = 0x%016" PRIx64 "\n", tls_handler_size);
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && defined(__x86_64__)
+	DemonsScreamRecovery::ConfigureFromEnvironment();
+#endif
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}

@@ -1,4 +1,5 @@
 #include "graphics/native_gpu/nativePm4.h"
+#include "graphics/native_gpu/nativePassCapture.h"
 
 #include <algorithm>
 #include <array>
@@ -37,6 +38,12 @@ using Libs::Graphics::NativeGpu::kWaitFlipPadToken;
 using Libs::Graphics::NativeGpu::WaitFlipGroupDw;
 using Libs::Graphics::NativeGpu::SetWaitFlipMarks;
 using Libs::Graphics::NativeGpu::AppendKernelReleases;
+
+// These packet tests run without guest memory or the live pass-capture backend.
+namespace NativePassCapture {
+bool Active() { return false; }
+void Submit(const Pass&) {}
+} // namespace NativePassCapture
 
 namespace {
 
@@ -2543,6 +2550,45 @@ void TestComputeRingPlainHeaders() {
 	      "an ACB's SET_SH_REG and DISPATCH_DIRECT reach MEC as written");
 	uint32_t bad = 0;
 	Check(ValidateNativeIb(r.ib, false, &bad, NativeIbKind::Compute), "the compute-ring check takes them");
+}
+
+// Wolverine continues a series of indirect dispatches in the next ACB. A different
+// shader is bound later in that buffer, after the dispatches that still need the old one.
+void TestComputeQueueShaderInheritance() {
+	constexpr uint32_t pgm = 0x20cu;
+	for (bool labels: {false, true}) {
+		Pm4Translator t;
+		TestOracle oracle;
+		t.SetComputeQueue(true);
+		t.SetComputeRing(true);
+		if (labels) {
+			t.SetNativeLabels(&oracle, kTrackerVa);
+		}
+		std::vector<uint32_t> setup, other, continuation;
+		Append(setup, IT_SET_SH_REG, {pgm, 0x9099399u, 0u}, false);
+		Append(other, IT_SET_SH_REG, {pgm, 0x1234u, 0u}, false);
+		Append(continuation, IT_SET_SH_REG, {0x240u, 0xc40e7500u, 0x780012u, 3u, 0x5204u, 0x6f117e00u}, false);
+		Append(continuation, 0x16u, {0x6f117e80u, 0x12u, 0x61u}, false);
+		Append(continuation, IT_SET_SH_REG, {pgm, 0x9098eb2u, 0u}, false);
+		Append(continuation, IT_DISPATCH_DIRECT, {1u, 1u, 1u, 0x61u}, false);
+		t.SelectComputeQueue(0x20);
+		Check(t.Translate(setup).ok, "first queue programs its shader");
+		t.SelectComputeQueue(0x28);
+		Check(t.Translate(other).ok, "second queue programs its shader");
+		t.SelectComputeQueue(0x20);
+		const auto r = t.Translate(continuation);
+		Check(r.ok && r.stats.dispatches == 2, "continuation translates both dispatches");
+		std::vector<uint32_t> programs;
+		uint32_t active = 0;
+		for (const auto& p: Decode(r.ib)) {
+			if (p.op == IT_SET_SH_REG && p.body[0] == pgm) {
+				active = p.body[1];
+			} else if (p.op == 0x16u || p.op == IT_DISPATCH_DIRECT) {
+				programs.push_back(active);
+			}
+		}
+		Check(programs == std::vector<uint32_t>{0x9099399u, 0x9098eb2u}, "each dispatch sees the shader bound on its queue at that point");
+	}
 }
 
 void TestComputeRingPackets() {
@@ -6816,6 +6862,7 @@ int main() {
 	TestLabelsWait64();
 	TestWaitFunctionsAll();
 	TestValidateNativeIb();
+	TestComputeQueueShaderInheritance();
 	TestComputeRingPackets();
 	TestComputeRingPlainHeaders();
 	TestContextStateOpPackets();

@@ -1,4 +1,6 @@
 #include "graphics/native_gpu/nativeShadow.h"
+#include "graphics/native_gpu/nativePassCapture.h"
+#include "graphics/native_gpu/nativeUpscaler.h"
 
 #include "graphics/native_gpu/nativeAcbNullGate.h"
 #include "graphics/native_gpu/nativeJobsAhead.h"
@@ -30,6 +32,7 @@
 #include <condition_variable>
 #include <array>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <ctime>
 #include <map>
@@ -3308,11 +3311,12 @@ public:
 	// fence, the slot's last dword. Compute rings run at once, and a barrier releases its own value into
 	// the fence and waits for exactly that value: a fence shared with another ring can be overwritten in
 	// between, and the wait never ends. Called on the label-pipeline thread before that queue is translated.
-	void UseAcbTracker(uint32_t slot) {
+	void UseAcbTracker(uint32_t slot, uint32_t guest_queue) {
 #if KYTY_GEM_BACKING_SUPPORTED
 		if (m_label_oracle == nullptr || m_submitter == nullptr || slot >= kTrackerSlots) {
 			return;
 		}
+		m_acb_translator.SelectComputeQueue(guest_queue);
 		const uint64_t va = m_submitter->ScratchVa() + kTrackerOffset + static_cast<uint64_t>(slot) * kTrackerStride;
 		m_acb_translator.SetNativeLabels(AcbThreadOn() ? m_acb_oracle : m_label_oracle, va);
 		m_acb_translator.SetFenceAddress(va + 12);
@@ -3325,6 +3329,7 @@ public:
 		m_acb_translator.SetGuestInterruptsCtx0(own && m_irq_ctx0);
 #else
 		(void)slot;
+		(void)guest_queue;
 #endif
 	}
 
@@ -4240,6 +4245,8 @@ public:
 			return;
 		}
 		dir += "/KytyPS5-Native/data";
+		std::error_code made; // a fresh system has no such folder yet
+		std::filesystem::create_directories(dir, made);
 		const std::string path = dir + "/gpu-fault.txt";
 		if (std::FILE* f = std::fopen(path.c_str(), "w"); f != nullptr) {
 			const std::time_t now = std::time(nullptr);
@@ -7317,6 +7324,15 @@ public:
 		m_cv.notify_one();
 	}
 
+	// Someone outside the tracker wrote a label a held piece waits on (ShadowWakeHeld).
+	void WakeHeld() {
+		{
+			std::lock_guard<std::mutex> lock(m_mutex);
+			m_wake = true;
+		}
+		m_cv.notify_one();
+	}
+
 	bool GpuWritable(uint64_t addr) override { return Shadow::Instance().GpuWritable(addr); }
 
 	bool SampleDword(uint64_t addr, uint32_t* out) override { return Shadow::Instance().SampleDword(addr, out); }
@@ -7690,7 +7706,7 @@ private:
 		Pm4TranslateResult r;
 		m_translating = job.queue;
 		if (m_acb_rings && compute && !m_acb_thread) {
-			Shadow::Instance().UseAcbTracker(SlotOf(job.queue));
+			Shadow::Instance().UseAcbTracker(SlotOf(job.queue), job.queue);
 		} else if (job.queue == kGuestAgrQueue) {
 			Shadow::Instance().UseAgrTracker(SlotOf(job.queue)); // before its waits are planned
 		}
@@ -7834,7 +7850,7 @@ private:
 		ready.queue   = job.queue;
 		ready.done    = std::move(done);
 		ready.made    = m_emits.load(std::memory_order_relaxed);
-		Shadow::Instance().UseAcbTracker(SlotOf(job.queue));
+		Shadow::Instance().UseAcbTracker(SlotOf(job.queue), job.queue);
 		ready.translated = Shadow::Instance().TranslateAcb(std::span<const uint32_t>(job.buffer, job.size_dw), &ready.t);
 		return ready;
 	}
@@ -8665,7 +8681,14 @@ private:
 	void Run(Entry& e) {
 		const TrackerPoint& p = e.point;
 		switch (p.kind) {
+			case TrackerPoint::Kind::UpscalerBoundary:
+				NativeUpscaler::GpuComplete(p.addr, m_native && !m_drain && Shadow::Instance().Reached(e.seq, e.slot));
+				break;
 			case TrackerPoint::Kind::Flip:
+				if (p.data.size() == 5) {
+					NativeUpscaler::FgNoteFlip(static_cast<int>(p.data[1])); // (frame generation: this flip's boundary)
+					NativePassCapture::NoteFlip(5);
+				}
 				if (HostCallbacks().flip && p.data.size() == 5) {
 					HostCallbacks().flip(static_cast<int>(p.data[0]), static_cast<int>(p.data[1]), static_cast<int>(p.data[2]),
 					                     static_cast<int64_t>(p.data[3] | (static_cast<uint64_t>(p.data[4]) << 32u)));
@@ -8983,6 +9006,10 @@ void ShadowEnqueue(const uint32_t* buffer, uint32_t size_in_dwords, uint32_t que
 	                             [then = std::move(then), buffer, size_in_dwords] {
 		                             then(std::span<const uint32_t>(buffer, size_in_dwords));
 	                             });
+}
+
+void ShadowWakeHeld() {
+	LabelPipeline::Instance().WakeHeld();
 }
 
 bool ShadowDmabufPieces(uint64_t vaddr, uint64_t size, std::vector<NativeDmabufPiece>& out) {
@@ -9443,6 +9470,7 @@ void DumpRenderTargets(const char* dir, unsigned long long flip,
 void ShadowOnFlip(uint64_t address, uint64_t size, uint32_t width, uint32_t height,
                   uint32_t bytes_per_pixel, uint32_t pixel_format, uint32_t tile_mode,
                   const std::function<uint32_t(uint64_t, uint64_t)>& download_region) {
+	NativePassCapture::NoteFlip(6); // (every displayed flip, whatever path requested it)
 	static std::atomic<uint64_t> flips {0};
 	const uint64_t               n    = flips.fetch_add(1, std::memory_order_relaxed);
 	if (address != 0 && size != 0 && Shadow::Instance().Active()) {
